@@ -40,6 +40,59 @@ def _sf(name: str, value, label: Optional[str] = None) -> dict:
     }
 
 
+# ─── Helpers: columns_metadata ──────────────────────────────────────────────
+
+# Map typeId UUIDs to the value-slug the platform stores in columns_metadata
+# (origin_node_type). Most are stable platform UUIDs; extend as we learn more.
+_TYPEID_TO_VALUE_SLUG = {
+    block_types.CUSTOM_CODE: "data_manipulation.custom_code",
+    block_types.MAGIC_NODE:  "data_manipulation.magic_node",
+    block_types.CSV_WRITE:   "file_management.csv_write",
+}
+
+
+def _typeid_to_value_slug(type_id: Optional[str]) -> str:
+    """Return the value-slug for a typeId, or the typeId itself as a safe default.
+
+    Used when constructing columns_metadata entries — the platform stores
+    `origin_node_type` as a slug like `data_manipulation.custom_code`. If we
+    don't recognize the typeId, return it unchanged; the platform will reject
+    if it's truly malformed.
+    """
+    if not type_id:
+        return ""
+    return _TYPEID_TO_VALUE_SLUG.get(type_id, type_id)
+
+
+def _build_columns_metadata(
+    output_columns: list[str],
+    output_dtypes: list[str],
+    *,
+    origin_node_id: str,
+    origin_node_name: str = "",
+    origin_node_type: str = "",
+) -> list[dict]:
+    """Build the columns_metadata payload the platform requires.
+
+    Bug fix in v0.2.5: prior versions omitted `origin_node_id`, causing PUT to
+    return 422 in some cases (column rename, downstream-validation paths). The
+    field is mandatory — the platform uses it to track which node "owns" each
+    output column for downstream lineage and validation.
+    """
+    return [
+        {
+            "column_name": col,
+            "data_type": dtype,
+            "is_nullable": True,
+            "origin_node_id": origin_node_id,
+            "origin_node_name": origin_node_name,
+            "origin_node_type": origin_node_type,
+            "nested_fields": None,
+        }
+        for col, dtype in zip(output_columns, output_dtypes)
+    ]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Auth
 # ═══════════════════════════════════════════════════════════════════════════
@@ -607,10 +660,12 @@ def attach_magic_node(
         for i, pid in enumerate(parent_node_ids)
     ]
 
-    columns_metadata = [
-        {"column_name": c, "data_type": d, "is_nullable": True}
-        for c, d in zip(output_columns, output_dtypes)
-    ]
+    columns_metadata = _build_columns_metadata(
+        output_columns, output_dtypes,
+        origin_node_id=new_id,
+        origin_node_name=name,
+        origin_node_type="data_manipulation.magic_node",
+    )
 
     # Position: 400 px right of rightmost parent, at average y.
     parents = [blocks_by_id[p] for p in parent_node_ids]
@@ -813,10 +868,12 @@ def attach_python_block(
         )
 
     new_id = str(uuid.uuid4())
-    columns_metadata = [
-        {"column_name": c, "data_type": d, "is_nullable": True}
-        for c, d in zip(output_columns, output_dtypes)
-    ]
+    columns_metadata = _build_columns_metadata(
+        output_columns, output_dtypes,
+        origin_node_id=new_id,
+        origin_node_name=name,
+        origin_node_type="data_manipulation.custom_code",
+    )
     px = position_x if position_x is not None else (parent["position"]["x"] + 400)
     py = position_y if position_y is not None else parent["position"]["y"]
 
@@ -2152,6 +2209,8 @@ def set_node_output_schema(
     if target is None:
         raise ValueError(f"node {node_id} not in workflow {workflow_id}")
 
+    type_label = _typeid_to_value_slug(target.get("typeId"))
+    target_name = target.get("variableName", "")
     col_names = []
     col_metadata = []
     for c in columns:
@@ -2162,6 +2221,13 @@ def set_node_output_schema(
             "column_name": c["name"],
             "data_type": c.get("dtype", "string"),
             "is_nullable": c.get("nullable", True),
+            # The platform requires origin_node_id on every column; without it
+            # PUT returns 422. Default to current node (callers can override
+            # for pass-through columns from upstream).
+            "origin_node_id": c.get("origin_node_id", node_id),
+            "origin_node_name": c.get("origin_node_name", target_name),
+            "origin_node_type": c.get("origin_node_type", type_label),
+            "nested_fields": c.get("nested_fields"),
         })
 
     target["outputs"] = [{
@@ -2285,6 +2351,413 @@ def clone_node(
         "node_config_error": err,
         "workflowConfigError": resp.get("workflowConfigError"),
         "validation": _maybe_validate(workflow_id, validate_after),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Discovery (workflows, node definitions, connections) — v0.2.5
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def list_workflows(
+    limit: int = 20,
+    offset: int = 0,
+    search: Optional[str] = None,
+) -> dict:
+    """List workflows in the current tenant. Paginated; supports search.
+
+    Returns slim view per workflow: id, name, description, version, isLive,
+    updatedAt, lastRunAt. Sorted by recency.
+
+    Use search to filter by name (case-insensitive substring match).
+    Use limit + offset for pagination.
+    """
+    raw = api.list_workflows(limit=limit, offset=offset, search=search)
+    items = raw.get("data", []) if isinstance(raw, dict) else (raw or [])
+    meta = (raw.get("meta") or {}) if isinstance(raw, dict) else {}
+    slim = [
+        {
+            "id": w.get("id"),
+            "name": w.get("name"),
+            "description": w.get("description"),
+            "version": w.get("version"),
+            "live_version": w.get("liveVersion"),
+            "is_live": (w.get("liveVersion") or 0) > 0,
+            "updated_at": w.get("updatedAt"),
+            "last_run_at": w.get("lastRunAt"),
+            "updated_by": w.get("updatedBy"),
+        }
+        for w in items
+    ]
+    return {
+        "count": len(slim),
+        "total_entries": meta.get("total_entries"),
+        "limit": meta.get("limit", limit),
+        "offset": meta.get("skip", offset),
+        "search": search,
+        "workflows": slim,
+    }
+
+
+@mcp.tool()
+def list_node_definitions(
+    limit: int = 50,
+    offset: int = 0,
+    search: Optional[str] = None,
+    category: Optional[str] = None,
+) -> dict:
+    """Catalog of every node type the platform supports.
+
+    Use this to discover typeIds before calling `attach_node`. Each result
+    carries `node_definition_id` (the typeId you pass to attach_node), `name`,
+    `category`, and `description`.
+
+    Use search to filter by name ("Gmail", "Scheduler", "Magic Node").
+    Use category to scope to one section (e.g. "Data Manipulation", "Gmail").
+
+    Combined search+category narrows further.
+    """
+    raw = api.list_node_definitions(limit=limit, offset=offset,
+                                     search=search, category=category)
+    items = raw.get("data", []) if isinstance(raw, dict) else []
+    meta = (raw.get("meta") or {}) if isinstance(raw, dict) else {}
+    slim = [
+        {
+            "type_id": n.get("node_definition_id"),
+            "value": n.get("value"),
+            "name": n.get("name"),
+            "category": n.get("category"),
+            "description": n.get("description"),
+            "is_trigger": n.get("is_trigger"),
+            "is_listener": n.get("isListener"),
+            "starting_price": n.get("startingPrice"),
+        }
+        for n in items
+    ]
+    return {
+        "count": len(slim),
+        "total_entries": meta.get("total_entries"),
+        "limit": meta.get("limit", limit),
+        "offset": meta.get("skip", offset),
+        "search": search,
+        "category": category,
+        "node_definitions": slim,
+    }
+
+
+@mcp.tool()
+def get_node_definition(type_id: str) -> dict:
+    """Fetch a single node definition by its typeId.
+
+    The platform has no get-by-id endpoint, so this paginates through the
+    catalog (5 pages × 100 = 500 max — the catalog is ~463 entries, so this
+    covers it). Returns the slim shape plus a `raw` field with all platform
+    fields (icon, vendorIcons, version).
+    """
+    PAGE = 100
+    for offset in range(0, 500, PAGE):
+        raw = api.list_node_definitions(limit=PAGE, offset=offset)
+        items = (raw.get("data") if isinstance(raw, dict) else []) or []
+        match = next((n for n in items if n.get("node_definition_id") == type_id), None)
+        if match:
+            return {
+                "ok": True,
+                "type_id": match.get("node_definition_id"),
+                "value": match.get("value"),
+                "name": match.get("name"),
+                "category": match.get("category"),
+                "description": match.get("description"),
+                "is_trigger": match.get("is_trigger"),
+                "is_listener": match.get("isListener"),
+                "starting_price": match.get("startingPrice"),
+                "icon": match.get("icon"),
+                "raw": match,
+            }
+        if not items or len(items) < PAGE:
+            break  # exhausted
+
+    return {
+        "ok": False,
+        "type_id": type_id,
+        "message": "node definition not found in catalog (scanned first 500 entries). "
+                   "Try list_node_definitions(search='<name>') to discover the right typeId.",
+    }
+
+
+@mcp.tool()
+def list_connections() -> dict:
+    """List the user's authorized OAuth connections (Gmail, Sheets, Slack, ...).
+
+    Use the returned `connection_id` when attaching app-backed nodes — those
+    nodes typically require a `connectionId` in their settings to know which
+    of your accounts to operate on.
+
+    Returns: {count, connections: [{connection_id, app_name, connection_name,
+    status, provider, created_at}]}.
+    """
+    raw = api.list_connections()
+    items = raw if isinstance(raw, list) else (raw.get("data") if isinstance(raw, dict) else []) or []
+    slim = [
+        {
+            "connection_id": c.get("connectionId"),
+            "connection_app_id": c.get("connectionAppId"),
+            "app_name": c.get("appName"),
+            "connection_name": c.get("connectionName"),
+            "provider": c.get("provider"),
+            "status": c.get("status"),
+            "created_at": c.get("createdAt"),
+            "updated_at": c.get("updatedAt"),
+        }
+        for c in items
+    ]
+    return {"count": len(slim), "connections": slim}
+
+
+@mcp.tool()
+def list_connection_apps(
+    limit: int = 50,
+    offset: int = 0,
+    category: Optional[str] = None,
+    search: Optional[str] = None,
+) -> dict:
+    """Catalog of apps the platform CAN connect to (vs `list_connections`
+    which shows what the user HAS connected).
+
+    Use search to find an app by name ("HubSpot", "Notion", etc.).
+    Use category to scope (e.g. "CRM", "Productivity").
+    """
+    raw = api.list_connection_apps(limit=limit, offset=offset,
+                                    category=category, search=search)
+    items = raw.get("data", []) if isinstance(raw, dict) else []
+    meta = (raw.get("meta") or {}) if isinstance(raw, dict) else {}
+    slim = [
+        {
+            "connection_app_id": a.get("connectionAppId"),
+            "app_id": a.get("appId"),
+            "name": a.get("name"),
+            "category": a.get("category"),
+            "description": a.get("description"),
+            "icon_url": a.get("iconUrl"),
+            "provider": a.get("provider"),
+            "is_active": a.get("isActive"),
+        }
+        for a in items
+    ]
+    return {
+        "count": len(slim),
+        "total_entries": meta.get("total_entries"),
+        "limit": meta.get("limit", limit),
+        "offset": meta.get("skip", offset),
+        "search": search,
+        "category": category,
+        "apps": slim,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Generic build (any node type) + workflow duplication — v0.2.5
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def attach_node(
+    workflow_id: str,
+    parent_node_ids: list[str],
+    type_id: str,
+    name: str,
+    settings: dict,
+    description: str = "",
+    position_x: Optional[float] = None,
+    position_y: Optional[float] = None,
+    output_columns: Optional[list[str]] = None,
+    output_dtypes: Optional[list[str]] = None,
+    is_trigger: bool = False,
+    credit_cost_per_item: int = 0,
+    validate_after: bool = True,
+) -> dict:
+    """Generic block-attach for ANY node type (Scheduler, Gmail, Calendar, AI, etc.).
+
+    Use `list_node_definitions(search="...")` first to find the typeId for the
+    node you want, plus understand its expected settings shape. Then construct
+    the `settings` dict (mapping field_name → value) and pass it here.
+
+    For app-backed nodes (Gmail send, Sheets read/write, Calendar list, etc.),
+    use `list_connections()` to find the connection_id and include it in the
+    settings as the platform expects (typically a field like
+    `pipedream-<app>-<action>-connectionId`).
+
+    `parent_node_ids` can be empty for trigger nodes (Scheduler etc.) — in
+    that case set `is_trigger=True` and the new node will be wired as a root.
+
+    `output_columns` is optional. Most app-backed nodes don't need explicit
+    output schema (the platform fills it in from the node definition); supply
+    it only when the platform validator complains.
+    """
+    if not type_id:
+        raise ValueError("type_id is required (use list_node_definitions to find it)")
+    if not isinstance(settings, dict):
+        raise ValueError("settings must be a dict mapping field_name → value")
+
+    wf = api.get_workflow(workflow_id)
+    blocks_by_id = {b["id"]: b for b in wf["blocks"]}
+    missing = [p for p in parent_node_ids if p not in blocks_by_id]
+    if missing:
+        raise ValueError(f"parent_node_ids not found in workflow {workflow_id}: {missing}")
+
+    new_id = str(uuid.uuid4())
+    type_slug = _typeid_to_value_slug(type_id)
+
+    # Position: 400 px right of rightmost parent (or origin for triggers)
+    if parent_node_ids:
+        parents = [blocks_by_id[p] for p in parent_node_ids]
+        if position_x is None:
+            position_x = max(p["position"]["x"] for p in parents) + 400
+        if position_y is None:
+            position_y = sum(p["position"]["y"] for p in parents) / len(parents)
+    else:
+        if position_x is None: position_x = 100
+        if position_y is None: position_y = -100
+
+    # Settings — wrap each field in the platform's _sf envelope
+    settings_field_values = [_sf(name=k, value=v) for k, v in settings.items()]
+
+    # Outputs — only set columns_metadata if caller specified columns
+    if output_columns:
+        if output_dtypes is None:
+            output_dtypes = ["string"] * len(output_columns)
+        if len(output_dtypes) != len(output_columns):
+            raise ValueError("output_dtypes length must match output_columns length")
+        outputs = [{
+            "columns": output_columns,
+            "columns_metadata": _build_columns_metadata(
+                output_columns, output_dtypes,
+                origin_node_id=new_id, origin_node_name=name,
+                origin_node_type=type_slug,
+            ),
+            "file": "",
+            "handle_condition": "_default",
+            "node_id": new_id,
+        }]
+    else:
+        outputs = [{
+            "columns": [], "columns_metadata": None, "file": "",
+            "handle_condition": "_default", "node_id": new_id,
+        }]
+
+    new_block = {
+        "id": new_id,
+        "typeId": type_id,
+        "variableName": name,
+        "description": description,
+        "settings_field_values": settings_field_values,
+        "isTrigger": is_trigger,
+        "isOrphan": False,
+        "isPartOfActiveSwimlane": True,
+        "isListener": False,
+        "isTestMode": False,
+        "inputs": [{
+            "columns": [], "columns_metadata": None, "file": "",
+            "handle_condition": "_default", "node_id": None,
+        }],
+        "outputs": outputs,
+        "toBlocks": [],
+        "position": {"x": float(position_x), "y": float(position_y)},
+        "creditCostPerItem": credit_cost_per_item,
+        "column_operations": None,
+        "node_config_error": None,
+    }
+
+    # Wire edges from each parent
+    for pid in parent_node_ids:
+        parent = blocks_by_id[pid]
+        edges = parent.get("toBlocks") or []
+        if not any(e.get("toBlockId") == new_id for e in edges):
+            edges.append({
+                "edgeId": f"{pid}-_default-{new_id}-_default",
+                "edge_source_handle_condition": "_default",
+                "edge_target_handle_condition": "_default",
+                "toBlockId": new_id,
+            })
+        parent["toBlocks"] = edges
+
+    all_blocks = wf["blocks"] + [new_block]
+    payload = {"workflow_details": {
+        "id": workflow_id,
+        "name": wf.get("name"),
+        "description": wf.get("description"),
+        "blocks": all_blocks,
+    }}
+    resp = api.put_workflow(workflow_id, payload)
+
+    err = next((b.get("node_config_error") for b in resp.get("blocks", []) if b["id"] == new_id), None)
+    return {
+        "ok": err is None,
+        "node_id": new_id,
+        "type_id": type_id,
+        "name": name,
+        "node_config_error": err,
+        "workflowConfigError": resp.get("workflowConfigError"),
+        "isRunable": resp.get("isRunable"),
+        "validation": _maybe_validate(workflow_id, validate_after),
+    }
+
+
+@mcp.tool()
+def paste_nodes(
+    workflow_id: str,
+    nodes: list[dict],
+    validate_after: bool = True,
+) -> dict:
+    """Paste pre-made node specs into a workflow (mirrors the UI's drag-from-palette).
+
+    For most use cases prefer `attach_node` — it's a higher-level wrapper that
+    handles edge-wiring and position defaults. Use `paste_nodes` when you need
+    the platform to auto-fill defaults from the node definition (e.g. for
+    complex AI nodes with deeply-nested settings).
+
+    `nodes` is a list of partial block dicts; the platform fills in defaults
+    from each node's typeId. Each entry should contain at minimum:
+        {"typeId": "<uuid>", "position": {"x": ..., "y": ...}}
+
+    Optionally include "variableName", "settings_field_values" (to override
+    defaults), and any other top-level block fields.
+
+    NOTE: this does NOT auto-wire edges between the pasted nodes or to existing
+    blocks. Call `add_edge` afterwards.
+    """
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError("nodes must be a non-empty list of block dicts")
+
+    resp = api.paste_nodes(workflow_id, {"nodes": nodes})
+    return {
+        "ok": True,
+        "response": resp,
+        "validation": _maybe_validate(workflow_id, validate_after),
+    }
+
+
+@mcp.tool()
+def duplicate_workflow(
+    workflow_id: str,
+    new_name: Optional[str] = None,
+) -> dict:
+    """Clone an entire workflow — all blocks, edges, settings — into a new one.
+
+    The new workflow is independent: edits to the duplicate don't affect the
+    source. Use this when you want to fork a workflow as the starting point
+    for a customer-specific variant, or to safely experiment without touching
+    the original.
+
+    `new_name` defaults to "Copy of <original_name>".
+
+    Returns the new workflow's id + name.
+    """
+    resp = api.duplicate_workflow(workflow_id, new_name=new_name)
+    return {
+        "ok": True,
+        "source_workflow_id": workflow_id,
+        "new_workflow_id": resp.get("id"),
+        "new_workflow_name": resp.get("name"),
+        "version": resp.get("version"),
     }
 
 

@@ -65,6 +65,102 @@ def get_workflow(wf_id: str) -> dict:
     return request("GET", f"/workflows/{wf_id}")
 
 
+def list_workflows(limit: int = 20, offset: int = 0, search: Optional[str] = None) -> dict:
+    """GET /workflows — paginated list with optional name-substring search.
+
+    Returns {data: [{id, name, description, updatedAt, lastRunAt, version, ...}], meta}.
+
+    NOTE: the platform's filter param is `name` (substring match on workflow
+    name), not `search`. We accept `search` in the wrapper for callsite
+    intuitiveness and translate it to `name`.
+    """
+    params: dict = {"limit": int(limit), "skip": int(offset)}
+    if search:
+        params["name"] = search
+    return request("GET", "/workflows", params=params)
+
+
+def duplicate_workflow(wf_id: str, new_name: Optional[str] = None) -> dict:
+    """POST /workflows/{id}/duplicate — clone an entire workflow.
+
+    Returns the new workflow object. If `new_name` is provided, the duplicate
+    is named accordingly; otherwise the platform auto-generates "Copy of X".
+    """
+    body = {"name": new_name} if new_name else {}
+    return request("POST", f"/workflows/{wf_id}/duplicate", json_body=body)
+
+
+def paste_nodes(wf_id: str, payload: dict) -> dict:
+    """POST /workflows/{id}/paste-nodes — paste pre-made node definitions.
+
+    Mirrors what the web UI does when you drag a node from the palette. The
+    payload shape varies by node type — typically a list of partially-built
+    block dicts with at minimum {typeId, position}; the platform fills in
+    default settings from the node definition.
+    """
+    return request("POST", f"/workflows/{wf_id}/paste-nodes", json_body=payload)
+
+
+def list_node_definitions(
+    limit: int = 50,
+    offset: int = 0,
+    search: Optional[str] = None,
+    category: Optional[str] = None,
+) -> dict:
+    """GET /node_definitions — paginated catalog of all node types.
+
+    `limit` is clamped to 100 (platform returns 422 above).
+
+    Returns {data: [{node_definition_id, value, name, category, description,
+    is_trigger, ...}], meta}. The `node_definition_id` IS the typeId used in
+    block.typeId throughout the platform.
+    """
+    params: dict = {"limit": max(1, min(int(limit), 100)), "skip": max(0, int(offset))}
+    if search:
+        params["search"] = search
+    if category:
+        params["category"] = category
+    return request("GET", "/node_definitions", params=params)
+
+
+def list_node_definition_categories(limit: int = 100) -> dict:
+    """GET /node_definitions/categories — all categories the platform groups
+    nodes by (Data Manipulation, Gmail, Google Sheets, etc.).
+    """
+    return request("GET", "/node_definitions/categories", params={"limit": int(limit)})
+
+
+def list_connections() -> list:
+    """GET /connections — user's authorized OAuth connections.
+
+    Returns a flat list (not wrapped in `data`/`meta`) of objects with
+    `connectionId`, `appName`, `connectionName`, `status`, etc. Needed when
+    attaching app-backed nodes (Gmail, Sheets, Calendar) — those nodes
+    require a `connectionId` in their settings.
+    """
+    return request("GET", "/connections")
+
+
+def list_connection_apps(
+    limit: int = 50,
+    offset: int = 0,
+    category: Optional[str] = None,
+    search: Optional[str] = None,
+) -> dict:
+    """GET /connections/apps — catalog of apps that CAN be connected.
+
+    Use this when the user wants to add an app integration but hasn't yet
+    connected the underlying account. Returns {data, meta} with each item
+    carrying `connectionAppId`, `name`, `category`, `iconUrl`, `provider`.
+    """
+    params: dict = {"limit": int(limit), "skip": int(offset)}
+    if category:
+        params["category"] = category
+    if search:
+        params["search"] = search
+    return request("GET", "/connections/apps", params=params)
+
+
 def put_workflow(wf_id: str, payload: dict) -> dict:
     """PUT /workflows/{wf} — payload must already be wrapped in {'workflow_details': {...}}."""
     return request("PUT", f"/workflows/{wf_id}", json_body=payload)
@@ -106,11 +202,16 @@ def create_workflow(name: str, description: str = "") -> dict:
     """POST /workflows — creates an empty workflow with no blocks.
 
     Returns the new workflow object including its assigned `id`.
+
+    NOTE: POST /workflows requires the body wrapped in {"workflow_details": {...}}
+    same as PUT — earlier doc claims this was unwrapped were wrong.
     """
     return request("POST", "/workflows", json_body={
-        "name": name,
-        "description": description,
-        "blocks": [],
+        "workflow_details": {
+            "name": name,
+            "description": description,
+            "blocks": [],
+        }
     })
 
 
