@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "nrev",
+  "description": "NurtureV internal plugins for Claude Code",
+  "owner": {
+    "name": "NurtureV"
+  },
+  "plugins": [
+    {
+      "name": "nrev-wf",
+      "description": "Build, debug, and operate nRev workflows from Claude — 31 tools wrapping the nRev workflow API. Per-user JWT auth, no secrets bundled.",
+      "source": "./plugins/nrev-wf",
+      "category": "productivity",
+      "keywords": ["nrev", "workflow", "gtm", "mcp"],
+      "version": "0.2.4"
+    }
+  ]
+}

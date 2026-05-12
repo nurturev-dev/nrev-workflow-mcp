@@ -1,0 +1,11 @@
+{
+  "name": "nrev-wf",
+  "version": "0.2.4",
+  "description": "Build, debug, and operate nRev workflows from Claude — 31 tools wrapping the nRev workflow API. Auth via per-user JWT, no secrets bundled.",
+  "author": {
+    "name": "NurtureV"
+  },
+  "homepage": "https://github.com/nurturev-dev/nrev-workflow-mcp",
+  "license": "Apache-2.0",
+  "keywords": ["nrev", "workflow", "gtm", "mcp"]
+}
