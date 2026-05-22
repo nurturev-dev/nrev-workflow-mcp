@@ -1,6 +1,8 @@
 # nrev-wf — Claude Code plugin
 
-31 tools for building, debugging, and operating nRev workflows from inside Claude. Internal NurtureV tool — auth is per-user JWT (paste once per Claude session, never stored).
+40 tools for building, debugging, and operating nRev workflows from inside Claude. Internal NurtureV tool — auth is per-user JWT (paste once per Claude session, never stored).
+
+Current version: **v0.2.8** — see release notes in the [repo README](https://github.com/nurturev-dev/nrev-workflow-mcp#release-notes).
 
 ## Install
 
@@ -11,7 +13,7 @@ In any Claude Code session:
 /plugin install nrev-wf@nrev
 ```
 
-Restart Claude Code. Run `/mcp` — you should see `nrev-wf` connected with 31 tools.
+Restart Claude Code. Run `/mcp` — you should see `nrev-wf` connected with 40 tools.
 
 ### Prerequisites (one-time)
 
@@ -45,14 +47,15 @@ Some example prompts:
 - *"Clone the AI node, swap the prompt, run it in test mode"* → `clone_node` + `partial_execute`
 - *"Cap all paid nodes at 5 rows before this run"* → `bulk_set_test_mode`
 
-## Tool surface (31 tools)
+## Tool surface (40 tools)
 
 | Group | Tools |
 |---|---|
 | **Auth** | `set_jwt`, `get_auth_status` |
-| **Read** | `get_workflow`, `get_node`, `get_workflow_graph`, `list_node_settings`, `get_node_neighbors`, `trace_path` |
+| **Read / inspect** | `get_workflow`, `list_workflows`, `get_node`, `get_workflow_graph`, `list_node_settings`, `get_node_neighbors`, `trace_path` |
+| **Discovery** | `list_node_definitions`, `get_node_definition`, `list_connections`, `list_connection_apps`, `list_field_options` |
 | **Validate** | `validate_workflow`, `validate_custom_code` |
-| **Build** | `create_workflow`, `attach_magic_node`, `attach_python_block`, `clone_node` |
+| **Build** | `create_workflow`, `attach_node`, `attach_magic_node`, `attach_python_block`, `paste_nodes`, `duplicate_workflow`, `clone_node` |
 | **Edit** | `update_node_setting`, `update_magic_node`, `update_ai_prompt`, `set_node_output_schema` |
 | **Wiring** | `add_edge`, `remove_edge`, `delete_node`, `splice_branch` |
 | **Run / monitor** | `list_executions`, `get_execution`, `get_node_output`, `partial_execute`, `tail_execution`, `abort_execution` |
@@ -62,6 +65,13 @@ Some example prompts:
 ## Update
 
 ```
+/plugin update nrev-wf
+```
+
+Then **fully quit and reopen Claude Code** so the MCP server respawns under the new version. If `/plugin update` doesn't pick up the new version, force-refresh the marketplace cache first:
+
+```
+/plugin marketplace update nrev
 /plugin update nrev-wf
 ```
 

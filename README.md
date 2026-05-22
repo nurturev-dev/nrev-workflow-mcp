@@ -1,8 +1,10 @@
 # nrev-workflow-mcp
 
-A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow API as **31 MCP tools** — build, debug, and operate workflows from inside any Claude session.
+A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow API as **40 MCP tools** — build, debug, and operate workflows from inside any Claude session.
 
 Internal tool. Auth is JWT-only, per-user, never stored.
+
+Current version: **v0.2.8** ([release notes](#release-notes)).
 
 ---
 
@@ -15,7 +17,7 @@ In any Claude Code session:
 /plugin install nrev-wf@nrev
 ```
 
-Restart Claude Code. Run `/mcp` and you should see `nrev-wf` with 31 tools.
+Restart Claude Code. Run `/mcp` and you should see `nrev-wf` with 40 tools.
 
 ### Prerequisites (one-time)
 
@@ -39,11 +41,22 @@ Once per Claude session:
 
 JWTs last 12 hours and live in the plugin's process memory only.
 
-### Update
+### Update (already-installed users)
 
 ```
 /plugin update nrev-wf
 ```
+
+Then **fully quit and reopen Claude Code** so the MCP server respawns under the new version. Verify with `/mcp` (tool count should be 40 on v0.2.6+).
+
+If `/plugin update` doesn't see the new version, force-refresh the marketplace cache:
+
+```
+/plugin marketplace update nrev
+/plugin update nrev-wf
+```
+
+Then restart.
 
 ---
 
@@ -81,14 +94,15 @@ nrev-workflow-mcp/
 
 ---
 
-## Tools (31)
+## Tools (40)
 
 | Group | Tools |
 |---|---|
 | **Auth** | `set_jwt`, `get_auth_status` |
-| **Read** | `get_workflow`, `get_node`, `get_workflow_graph`, `list_node_settings`, `get_node_neighbors`, `trace_path` |
+| **Read / inspect** | `get_workflow`, `list_workflows`, `get_node`, `get_workflow_graph`, `list_node_settings`, `get_node_neighbors`, `trace_path` |
+| **Discovery** | `list_node_definitions`, `get_node_definition`, `list_connections`, `list_connection_apps`, `list_field_options` |
 | **Validate** | `validate_workflow`, `validate_custom_code` |
-| **Build** | `create_workflow`, `attach_magic_node`, `attach_python_block`, `clone_node` |
+| **Build** | `create_workflow`, `attach_node`, `attach_magic_node`, `attach_python_block`, `paste_nodes`, `duplicate_workflow`, `clone_node` |
 | **Edit** | `update_node_setting`, `update_magic_node`, `update_ai_prompt`, `set_node_output_schema` |
 | **Wiring** | `add_edge`, `remove_edge`, `delete_node`, `splice_branch` |
 | **Run / monitor** | `list_executions`, `get_execution`, `get_node_output`, `partial_execute`, `tail_execution`, `abort_execution` |
@@ -139,25 +153,59 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 ---
 
+## Release notes
+
+Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest.
+
+### v0.2.8 — big-workflow support
+- **Fixes HTTP 413 on workflows past ~50 blocks.** `attach_node`, `attach_magic_node`, `attach_python_block` no longer re-send the entire workflow on every PUT. New small-payload path: POST `/paste-nodes` for the new block (~2 KB), then per-parent `PUT /nodes/{parent_id}` with the new edge appended (~3 KB each). Live-tested on a 1.1 MB / 58-block workflow.
+- Handles the platform's silent UUID-reassignment on paste (the new block's id changes server-side; the helper detects the new id via diff and rewrites all internal self-references before wiring edges).
+- ⚠ Known limitation: 11 other mutating tools still use the giant-PUT path and will fail on big workflows: `delete_node`, `update_node_setting`, `update_magic_node`, `update_ai_prompt`, `add_edge`, `remove_edge`, `splice_branch`, `clone_node`, `set_test_mode`, `bulk_set_test_mode`, `set_node_output_schema`. Targeted for v0.2.9.
+
+### v0.2.7 — Scheduler workflows can go live
+- `attach_node` now auto-detects `isTrigger` AND `isListener` from the node-definition catalog. Pre-v0.2.7 callers had to remember `is_trigger=True` and there was no way to set `isListener` at all — which left Scheduler-rooted workflows with the misleading "Add a Trigger Node ⚡ to go live" tooltip blocking the live toggle.
+- New `is_listener` parameter (defaults to None = auto-detect). Both flags can still be explicitly overridden when the caller knows better.
+- Lookup is cached (`lru_cache`) so the catalog is paginated once per typeId per server lifetime.
+
+### v0.2.6 — human-readable dropdown labels
+- `attach_node(field_labels={...})` for explicit per-field human labels (e.g. `{"sheetId": "Competitive tracking"}`).
+- `attach_node(auto_resolve_labels=True)` (default) automatically calls `/nodes/field-options` for known dropdown fields and resolves IDs to labels — Pipedream-wrapped nodes (Sheets, Gmail, Calendar, Slack) now show real names instead of opaque UUIDs in the UI.
+- New `list_field_options(workflow_id, node_id, field_name)` tool for inspection / cascade discovery.
+- `connection_id` fields are special-cased to `list_connections()` (the field-options endpoint can't resolve them; circular dependency).
+
+### v0.2.5 — discovery + generic builder
+- New generic `attach_node` builder works for ANY node type (Scheduler, Gmail, Calendar, AI, etc.) — not just Magic Node and Custom Code.
+- Discovery tools: `list_node_definitions`, `get_node_definition`, `list_connections`, `list_connection_apps`, `list_workflows`, `paste_nodes`, `duplicate_workflow`.
+- Fixed `columns_metadata` 422 bug (missing `origin_node_id` was breaking column-rename and downstream-validation paths).
+
+### v0.2.4 — public release
+- Restructured as Claude Code marketplace + plugin (this layout).
+- Bulletproof launcher script (`bin/run-mcp.sh`) handles missing `uv` gracefully and pins the cache dir outside the per-plugin folder.
+- 31 tools, all of the core build / edit / wire / run / test-mode primitives.
+
+---
+
 ## Engineering / development
 
 ```bash
 git clone https://github.com/nurturev-dev/nrev-workflow-mcp ~/Projects/nrev-workflow-mcp
 cd ~/Projects/nrev-workflow-mcp
 ./scripts/setup.sh                                          # installs editable, prints MCP config snippet
-pytest -q                                                   # run the test suite (81 tests)
+pytest -q                                                   # run the test suite (128 tests as of v0.2.8)
 ./scripts/sync-plugin.sh                                    # mirror src/ → plugins/nrev-wf/mcp/ before release
 ```
 
 When making changes, the workflow is:
 1. Edit `src/nrev_wf_mcp/`
 2. Run `pytest -q`
-3. Bump `src/nrev_wf_mcp/__init__.py` version
-4. Run `./scripts/sync-plugin.sh` (mirrors the source into the plugin)
-5. Update `plugins/nrev-wf/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` versions
-6. Commit, tag (`git tag v0.2.x`), push (`git push && git push --tags`)
+3. Bump version in **three places** (they must agree):
+   - `src/nrev_wf_mcp/__init__.py`
+   - `.claude-plugin/marketplace.json` (plugin entry's `version` field)
+   - `plugins/nrev-wf/.claude-plugin/plugin.json`
+4. Run `./scripts/sync-plugin.sh` (mirrors source into the plugin + stamps `plugins/nrev-wf/mcp/pyproject.toml`)
+5. Commit, tag (`git tag -a v0.2.x -m "..."`), push (`git push && git push origin v0.2.x`)
 
-End users get the new version via `/plugin update nrev-wf`.
+End users get the new version via `/plugin update nrev-wf` followed by a Claude Code restart.
 
 ---
 
