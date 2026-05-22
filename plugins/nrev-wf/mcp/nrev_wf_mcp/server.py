@@ -2869,6 +2869,7 @@ def attach_node(
     credit_cost_per_item: int = 0,
     field_labels: Optional[dict] = None,
     auto_resolve_labels: bool = True,
+    allow_multi_input: bool = False,
     validate_after: bool = True,
 ) -> dict:
     """Generic block-attach for ANY node type (Scheduler, Gmail, Calendar, AI, etc.).
@@ -2882,13 +2883,23 @@ def attach_node(
     settings as the platform expects (typically a field like
     `pipedream-<app>-<action>-connectionId`).
 
-    `parent_node_ids` can be empty for trigger nodes (Scheduler etc.). When
-    `is_trigger` / `is_listener` are left as their defaults (None), this tool
-    looks up the node-definition catalog and sets both flags automatically —
-    so attaching a Scheduler with no parents produces a real trigger that the
-    workflow's "Go Live" toggle accepts, with no extra ceremony required from
-    the caller. Override either flag explicitly (True/False) only when you
-    know the catalog default is wrong for your use case.
+    `parent_node_ids`: ZERO entries for trigger nodes (Scheduler etc.), or
+    ONE entry for everything else. This tool refuses 2+ parents by default
+    because almost every node type (Custom Code, HubSpot, Gmail, Sheets,
+    Slack, AI, etc.) is single-input — multiple `_default` edges into a
+    single-input node leave the workflow silently broken at runtime. For
+    joining or merging multiple data streams use `attach_magic_node`
+    (1–5 inputs, df1..dfN handles, the correct pattern). The only legitimate
+    multi-input non-Magic node is the legacy Merge block; pass
+    `allow_multi_input=True` if you genuinely need that.
+
+    When `is_trigger` / `is_listener` are left as their defaults (None),
+    this tool looks up the node-definition catalog and sets both flags
+    automatically — so attaching a Scheduler with no parents produces a
+    real trigger that the workflow's "Go Live" toggle accepts, with no
+    extra ceremony required from the caller. Override either flag
+    explicitly (True/False) only when you know the catalog default is
+    wrong for your use case.
 
     `output_columns` is optional. Most app-backed nodes don't need explicit
     output schema (the platform fills it in from the node definition); supply
@@ -2920,6 +2931,35 @@ def attach_node(
         raise ValueError("type_id is required (use list_node_definitions to find it)")
     if not isinstance(settings, dict):
         raise ValueError("settings must be a dict mapping field_name → value")
+
+    # ── Single-input guard ──────────────────────────────────────────────────
+    # Almost every nRev node type is single-input. Multi-input is the
+    # exception (Magic Node 1–5, legacy Merge 2). Allowing the caller to wire
+    # multiple `_default` edges into a single-input node silently produces a
+    # workflow that looks correct in the UI but fails at execution — the
+    # downstream block only knows how to read one input. Refuse here so the
+    # caller is forced to switch to attach_magic_node when they really want
+    # a join, or opt in explicitly via allow_multi_input.
+    if len(parent_node_ids) > 1 and not allow_multi_input:
+        magic_hint = ""
+        if type_id == block_types.MAGIC_NODE:
+            magic_hint = (
+                " You passed the Magic Node typeId; use attach_magic_node "
+                "instead — it sets up the df1..dfN target handles and "
+                "references list that Magic Node requires."
+            )
+        else:
+            magic_hint = (
+                " For joining or merging multiple data streams use "
+                "attach_magic_node (1–5 inputs, df1..dfN handles). For the "
+                "legacy Merge block specifically, pass allow_multi_input=True."
+            )
+        raise ValueError(
+            f"attach_node refuses to wire {len(parent_node_ids)} parents into "
+            f"a single-input node ({type_id}). Multiple `_default` edges into "
+            f"one block looks fine in the UI but silently breaks at execution."
+            f"{magic_hint}"
+        )
 
     wf = api.get_workflow(workflow_id)
     blocks_by_id = {b["id"]: b for b in wf["blocks"]}

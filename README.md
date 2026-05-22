@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.10** ([release notes](#release-notes)).
+Current version: **v0.2.11** ([release notes](#release-notes)).
 
 ---
 
@@ -224,6 +224,12 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.11 — single-input guard in `attach_node`
+- `attach_node` now refuses 2+ parents by default. Pre-v0.2.11 it silently created multiple `_default` edges into single-input nodes (HubSpot, Gmail, Sheets, Custom Code, AI — almost everything), producing workflows that looked correct in the UI but failed silently at execution.
+- Error message points to `attach_magic_node` (1–5 inputs with `df1..dfN` handles — the right pattern for joins/merges) and special-cases the Magic Node typeId with a more specific hint.
+- New `allow_multi_input=True` escape hatch for the legacy Merge block.
+- Trigger nodes (0 parents) and the common single-parent case are unaffected.
 
 ### v0.2.10 — one-line installer (no git required)
 - New `scripts/install.sh` downloads a release tarball via `curl`/`wget`, installs `uv` if missing, and registers the MCP server via `claude mcp add` — for colleagues who don't have `git` set up or who hit GitHub-auth friction.
