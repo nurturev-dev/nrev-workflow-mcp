@@ -2,7 +2,7 @@
 
 40 tools for building, debugging, and operating nRev workflows from inside Claude. Internal NurtureV tool — auth is per-user JWT (paste once per Claude session, never stored).
 
-Current version: **v0.2.8** — see release notes in the [repo README](https://github.com/nurturev-dev/nrev-workflow-mcp#release-notes).
+Current version: **v0.2.9** — see release notes in the [repo README](https://github.com/nurturev-dev/nrev-workflow-mcp#release-notes).
 
 ## Install
 
@@ -74,6 +74,22 @@ Then **fully quit and reopen Claude Code** so the MCP server respawns under the 
 /plugin marketplace update nrev
 /plugin update nrev-wf
 ```
+
+## No `/plugin` slash command in your environment?
+
+Older Claude Code builds, locked-down corporate installs, and several other MCP-capable clients (Cursor, Windsurf, Continue) don't expose `/plugin` or `/mcp`. The plugin still works — register the MCP server manually:
+
+```bash
+git clone https://github.com/nurturev-dev/nrev-workflow-mcp ~/Projects/nrev-workflow-mcp
+
+# Then in a terminal (works even when /plugin doesn't):
+claude mcp add nrev-wf --scope user -- \
+  ~/Projects/nrev-workflow-mcp/plugins/nrev-wf/bin/run-mcp.sh
+```
+
+Full instructions including a JSON-config fallback (for non-Claude-Code clients): see [`Manual install`](https://github.com/nurturev-dev/nrev-workflow-mcp#manual-install-no-plugin-slash-command-available) in the repo README.
+
+To update a manual install: `cd ~/Projects/nrev-workflow-mcp && git pull`, then restart Claude Code.
 
 ## Troubleshooting
 

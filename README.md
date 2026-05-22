@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.8** ([release notes](#release-notes)).
+Current version: **v0.2.9** ([release notes](#release-notes)).
 
 ---
 
@@ -57,6 +57,70 @@ If `/plugin update` doesn't see the new version, force-refresh the marketplace c
 ```
 
 Then restart.
+
+---
+
+## Manual install (no `/plugin` slash command available)
+
+Some Claude Code builds — older releases, locked-down corporate installs, and several other MCP-capable clients (Cursor, Windsurf, Continue, etc.) — don't expose the `/plugin` and `/mcp` slash commands. The plugin still works; you just register the MCP server by hand.
+
+### Step 1 — Clone the repo
+
+```bash
+git clone https://github.com/nurturev-dev/nrev-workflow-mcp ~/Projects/nrev-workflow-mcp
+```
+
+(Any path works — adjust the rest accordingly.)
+
+### Step 2 — Install `uv` if you don't have it
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Restart your terminal after install. The plugin's launcher uses `uv` to manage Python dependencies on first run.
+
+### Step 3a — Register via `claude mcp add` (Claude Code CLI)
+
+This command exists in every Claude Code build, even ones without `/plugin`:
+
+```bash
+claude mcp add nrev-wf --scope user -- \
+  ~/Projects/nrev-workflow-mcp/plugins/nrev-wf/bin/run-mcp.sh
+```
+
+`--scope user` makes the server available in every project. Drop the flag to scope to the current project only.
+
+### Step 3b — Or hand-edit your MCP config (any MCP-capable client)
+
+If `claude mcp add` is also unavailable, add this entry to your client's MCP config (typically `~/.claude.json` for Claude Code, similar paths for others):
+
+```json
+{
+  "mcpServers": {
+    "nrev-wf": {
+      "command": "/Users/you/Projects/nrev-workflow-mcp/plugins/nrev-wf/bin/run-mcp.sh"
+    }
+  }
+}
+```
+
+Use the **absolute path** — replace `/Users/you/...` with the real path to your clone.
+
+### Step 4 — Restart Claude Code (full quit and reopen)
+
+The MCP server only respawns on a clean restart. After restart, the 40 `nrev-wf` tools should be available — try a prompt like *"List my nrev workflows"* (the tool itself will then ask you to set a JWT).
+
+### Updating a manual install
+
+```bash
+cd ~/Projects/nrev-workflow-mcp
+git pull
+```
+
+Restart Claude Code. The launcher reads the latest source on next spawn (`uv` handles dependency updates automatically when `pyproject.toml` changes).
+
+To pin to a specific version: `git checkout v0.2.9` (or whichever tag).
 
 ---
 
@@ -155,7 +219,12 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 ## Release notes
 
-Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest.
+Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: `git pull` in the clone, then restart.)
+
+### v0.2.9 — works without `/plugin`
+- Launcher is now self-locating: works whether invoked by the Claude Code plugin loader (with `${CLAUDE_PLUGIN_ROOT}` set) OR directly by absolute path from `claude mcp add` / a hand-edited `~/.claude.json`. This unblocks colleagues on older Claude Code builds, locked-down corporate installs, and other MCP-capable clients (Cursor, Windsurf, Continue).
+- Documents the [manual install path](#manual-install-no-plugin-slash-command-available) for those environments.
+- Launcher also gained an upfront layout check that prints a helpful error if the script is run from a malformed clone (vs the previous silent uv-run failure).
 
 ### v0.2.8 — big-workflow support
 - **Fixes HTTP 413 on workflows past ~50 blocks.** `attach_node`, `attach_magic_node`, `attach_python_block` no longer re-send the entire workflow on every PUT. New small-payload path: POST `/paste-nodes` for the new block (~2 KB), then per-parent `PUT /nodes/{parent_id}` with the new edge appended (~3 KB each). Live-tested on a 1.1 MB / 58-block workflow.
