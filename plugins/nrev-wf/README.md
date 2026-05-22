@@ -2,7 +2,7 @@
 
 40 tools for building, debugging, and operating nRev workflows from inside Claude. Internal NurtureV tool — auth is per-user JWT (paste once per Claude session, never stored).
 
-Current version: **v0.2.9** — see release notes in the [repo README](https://github.com/nurturev-dev/nrev-workflow-mcp#release-notes).
+Current version: **v0.2.10** — see release notes in the [repo README](https://github.com/nurturev-dev/nrev-workflow-mcp#release-notes).
 
 ## Install
 
@@ -77,19 +77,15 @@ Then **fully quit and reopen Claude Code** so the MCP server respawns under the 
 
 ## No `/plugin` slash command in your environment?
 
-Older Claude Code builds, locked-down corporate installs, and several other MCP-capable clients (Cursor, Windsurf, Continue) don't expose `/plugin` or `/mcp`. The plugin still works — register the MCP server manually:
+Older Claude Code builds, locked-down corporate installs, and other MCP-capable clients (Cursor, Windsurf, Continue) don't expose `/plugin` or `/mcp`. And not everyone has `git` set up. Use the one-line installer — no git, no plugin system required:
 
 ```bash
-git clone https://github.com/nurturev-dev/nrev-workflow-mcp ~/Projects/nrev-workflow-mcp
-
-# Then in a terminal (works even when /plugin doesn't):
-claude mcp add nrev-wf --scope user -- \
-  ~/Projects/nrev-workflow-mcp/plugins/nrev-wf/bin/run-mcp.sh
+curl -sSL https://raw.githubusercontent.com/nurturev-dev/nrev-workflow-mcp/main/scripts/install.sh | bash
 ```
 
-Full instructions including a JSON-config fallback (for non-Claude-Code clients): see [`Manual install`](https://github.com/nurturev-dev/nrev-workflow-mcp#manual-install-no-plugin-slash-command-available) in the repo README.
+It downloads a tarball, installs `uv` if needed, and registers the MCP server. Restart Claude Code and you're done. To upgrade, re-run the same one-liner.
 
-To update a manual install: `cd ~/Projects/nrev-workflow-mcp && git pull`, then restart Claude Code.
+Full instructions (including a `git clone` path and a hand-paste JSON config for clients without the `claude` CLI): see [`Install without /plugin`](https://github.com/nurturev-dev/nrev-workflow-mcp#install-without-plugin-one-line-installer) in the repo README.
 
 ## Troubleshooting
 

@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.9** ([release notes](#release-notes)).
+Current version: **v0.2.10** ([release notes](#release-notes)).
 
 ---
 
@@ -60,67 +60,71 @@ Then restart.
 
 ---
 
-## Manual install (no `/plugin` slash command available)
+## Install without `/plugin` (one-line installer)
 
-Some Claude Code builds — older releases, locked-down corporate installs, and several other MCP-capable clients (Cursor, Windsurf, Continue, etc.) — don't expose the `/plugin` and `/mcp` slash commands. The plugin still works; you just register the MCP server by hand.
-
-### Step 1 — Clone the repo
+Some environments don't have the `/plugin` slash command — older Claude Code builds, locked-down corporate installs, and other MCP-capable clients (Cursor, Windsurf, Continue). And some colleagues don't have `git` set up at all. The plugin still works; use the one-line installer:
 
 ```bash
+curl -sSL https://raw.githubusercontent.com/nurturev-dev/nrev-workflow-mcp/main/scripts/install.sh | bash
+```
+
+What it does:
+
+1. Downloads the latest tagged release as a tarball (no `git` required — just `curl` or `wget`).
+2. Extracts it to `~/.nrev-wf-mcp/` (override with `NREV_WF_INSTALL_DIR=/path`).
+3. Installs `uv` if missing (the Python package manager the launcher uses).
+4. Registers the MCP server via `claude mcp add nrev-wf --scope user`. If the `claude` CLI isn't on your PATH, prints a JSON snippet to hand-paste into `~/.claude.json`.
+
+Then **fully quit and reopen Claude Code**. The 40 `nrev-wf` tools should be live. First prompt to verify: *"List my nrev workflows"* — it'll ask you to set a JWT.
+
+### Pin to a specific version
+
+```bash
+curl -sSL https://raw.githubusercontent.com/nurturev-dev/nrev-workflow-mcp/main/scripts/install.sh | bash -s v0.2.9
+```
+
+### Upgrade later
+
+Re-run the same one-liner. It wipes the install dir, fetches the new release, and re-registers — your MCP config entry stays consistent and your JWT is unaffected (JWTs live in process memory only, never on disk).
+
+### Uninstall
+
+```bash
+claude mcp remove nrev-wf --scope user
+rm -rf ~/.nrev-wf-mcp
+```
+
+---
+
+## Manual install via `git clone` (if you prefer)
+
+For colleagues who want the source tree on disk for inspection or local edits:
+
+```bash
+# 1. Clone (uses public HTTPS — no GitHub auth required)
 git clone https://github.com/nurturev-dev/nrev-workflow-mcp ~/Projects/nrev-workflow-mcp
-```
 
-(Any path works — adjust the rest accordingly.)
-
-### Step 2 — Install `uv` if you don't have it
-
-```bash
+# 2. Install uv if you don't have it
 curl -LsSf https://astral.sh/uv/install.sh | sh
-```
 
-Restart your terminal after install. The plugin's launcher uses `uv` to manage Python dependencies on first run.
-
-### Step 3a — Register via `claude mcp add` (Claude Code CLI)
-
-This command exists in every Claude Code build, even ones without `/plugin`:
-
-```bash
+# 3a. Register via claude mcp add (works without /plugin)
 claude mcp add nrev-wf --scope user -- \
   ~/Projects/nrev-workflow-mcp/plugins/nrev-wf/bin/run-mcp.sh
+
+# 3b. Or hand-edit ~/.claude.json (for non-Claude-Code clients):
+#   {
+#     "mcpServers": {
+#       "nrev-wf": {
+#         "command": "/Users/you/Projects/nrev-workflow-mcp/plugins/nrev-wf/bin/run-mcp.sh"
+#       }
+#     }
+#   }
+# Use the absolute path.
+
+# 4. Fully quit and reopen Claude Code
 ```
 
-`--scope user` makes the server available in every project. Drop the flag to scope to the current project only.
-
-### Step 3b — Or hand-edit your MCP config (any MCP-capable client)
-
-If `claude mcp add` is also unavailable, add this entry to your client's MCP config (typically `~/.claude.json` for Claude Code, similar paths for others):
-
-```json
-{
-  "mcpServers": {
-    "nrev-wf": {
-      "command": "/Users/you/Projects/nrev-workflow-mcp/plugins/nrev-wf/bin/run-mcp.sh"
-    }
-  }
-}
-```
-
-Use the **absolute path** — replace `/Users/you/...` with the real path to your clone.
-
-### Step 4 — Restart Claude Code (full quit and reopen)
-
-The MCP server only respawns on a clean restart. After restart, the 40 `nrev-wf` tools should be available — try a prompt like *"List my nrev workflows"* (the tool itself will then ask you to set a JWT).
-
-### Updating a manual install
-
-```bash
-cd ~/Projects/nrev-workflow-mcp
-git pull
-```
-
-Restart Claude Code. The launcher reads the latest source on next spawn (`uv` handles dependency updates automatically when `pyproject.toml` changes).
-
-To pin to a specific version: `git checkout v0.2.9` (or whichever tag).
+Update with `git pull` in the clone + restart. Pin to a version with `git checkout v0.2.9`.
 
 ---
 
@@ -219,7 +223,13 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 ## Release notes
 
-Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: `git pull` in the clone, then restart.)
+Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.10 — one-line installer (no git required)
+- New `scripts/install.sh` downloads a release tarball via `curl`/`wget`, installs `uv` if missing, and registers the MCP server via `claude mcp add` — for colleagues who don't have `git` set up or who hit GitHub-auth friction.
+- Idempotent: re-running the script upgrades in place (wipes install dir, re-fetches, re-registers; MCP config entry stays consistent; in-memory JWT is unaffected because JWTs aren't persisted by design).
+- Resolves "latest tag" from GitHub's tags API by default; accepts an explicit `bash -s v0.2.10` arg to pin.
+- Falls back gracefully when the `claude` CLI isn't on PATH (prints a JSON snippet to paste into `~/.claude.json` or other MCP-capable clients' configs).
 
 ### v0.2.9 — works without `/plugin`
 - Launcher is now self-locating: works whether invoked by the Claude Code plugin loader (with `${CLAUDE_PLUGIN_ROOT}` set) OR directly by absolute path from `claude mcp add` / a hand-edited `~/.claude.json`. This unblocks colleagues on older Claude Code builds, locked-down corporate installs, and other MCP-capable clients (Cursor, Windsurf, Continue).
