@@ -117,23 +117,57 @@ def test_lookup_caches_repeated_calls():
         assert mock_list.call_count == 1
 
 
-# ── attach_node integration: flags propagate to the PUT body ─────────────
+# ── attach_node integration: flags propagate to the paste-nodes body ─────
+
+
+def _mock_paste_capture(captured: dict, preserve_id: bool = True):
+    """Build a fake paste_nodes that records the body sent, then echoes back
+    the pasted block. By default preserves the sent id so the helper's
+    no-reassignment path is exercised. Pass preserve_id=False to simulate
+    the platform's id-reassignment behavior.
+
+    The fake also includes any pre-existing blocks from
+    `captured["existing_blocks"]` (if set) so the helper's id-diff logic
+    has the right baseline.
+    """
+    def fake_paste(wf_id, body):
+        captured.setdefault("paste_bodies", []).append(body)
+        echoed_nodes = []
+        for n in body["nodes"]:
+            copy = dict(n)
+            if not preserve_id:
+                copy["id"] = f"platform-{n['id']}"
+            echoed_nodes.append(copy)
+        return {
+            "blocks": (captured.get("existing_blocks") or []) + echoed_nodes,
+            "isRunable": True,
+            "workflowConfigError": None,
+        }
+    return fake_paste
+
+
+def _mock_put_node_capture(captured: dict):
+    """Records every put_node call so the test can inspect which parents got
+    edge updates."""
+    def fake_put_node(wf_id, node_id, node_patch):
+        captured.setdefault("put_node_calls", []).append((node_id, node_patch))
+        return node_patch
+    return fake_put_node
 
 
 def test_attach_node_auto_sets_trigger_listener_for_scheduler():
-    """End-to-end: attach a Scheduler with default flags. The PUT body must
-    carry isTrigger=True AND isListener=True so the workflow can go live."""
+    """End-to-end: attach a Scheduler with default flags. The block sent to
+    paste-nodes must carry isTrigger=True AND isListener=True so the
+    workflow can go live."""
     from nrev_wf_mcp.server import attach_node
 
     _lookup_node_def_flags.cache_clear()
-    captured = {}
-
-    def fake_put(wf_id, payload):
-        captured["payload"] = payload
-        return {"blocks": payload["workflow_details"]["blocks"], "isRunable": True}
+    captured: dict = {}
 
     with patch("nrev_wf_mcp.server.api.get_workflow") as mock_get, \
-         patch("nrev_wf_mcp.server.api.put_workflow", side_effect=fake_put), \
+         patch("nrev_wf_mcp.server.api.paste_nodes", side_effect=_mock_paste_capture(captured)), \
+         patch("nrev_wf_mcp.server.api.put_node", side_effect=_mock_put_node_capture(captured)), \
+         patch("nrev_wf_mcp.server.api.put_workflow") as mock_put_wf, \
          patch("nrev_wf_mcp.server.api.list_node_definitions") as mock_list, \
          patch("nrev_wf_mcp.server._maybe_validate", return_value=None):
         mock_get.return_value = {
@@ -155,25 +189,29 @@ def test_attach_node_auto_sets_trigger_listener_for_scheduler():
     assert result["ok"]
     assert result["is_trigger"] is True
     assert result["is_listener"] is True
-    new_block = captured["payload"]["workflow_details"]["blocks"][0]
-    assert new_block["isTrigger"] is True
-    assert new_block["isListener"] is True
+    # The new path MUST NOT call put_workflow (the giant-PUT that 413s on big WFs)
+    mock_put_wf.assert_not_called()
+    # paste-nodes called once, with our block
+    assert len(captured["paste_bodies"]) == 1
+    pasted = captured["paste_bodies"][0]["nodes"][0]
+    assert pasted["isTrigger"] is True
+    assert pasted["isListener"] is True
+    # No parents → no put_node edge calls
+    assert captured.get("put_node_calls", []) == []
 
 
 def test_attach_node_keeps_non_trigger_default_for_app_node():
-    """Add Single Row is not a trigger — both flags must be False even when
-    the caller leaves them at the default."""
+    """Add Single Row is not a trigger — both flags must be False, and the
+    one parent must get exactly one put_node edge-wiring call."""
     from nrev_wf_mcp.server import attach_node
 
     _lookup_node_def_flags.cache_clear()
-    captured = {}
-
-    def fake_put(wf_id, payload):
-        captured["payload"] = payload
-        return {"blocks": payload["workflow_details"]["blocks"]}
+    captured: dict = {}
 
     with patch("nrev_wf_mcp.server.api.get_workflow") as mock_get, \
-         patch("nrev_wf_mcp.server.api.put_workflow", side_effect=fake_put), \
+         patch("nrev_wf_mcp.server.api.paste_nodes", side_effect=_mock_paste_capture(captured)), \
+         patch("nrev_wf_mcp.server.api.put_node", side_effect=_mock_put_node_capture(captured)), \
+         patch("nrev_wf_mcp.server.api.put_workflow") as mock_put_wf, \
          patch("nrev_wf_mcp.server.api.list_node_definitions") as mock_list, \
          patch("nrev_wf_mcp.server._maybe_validate", return_value=None):
         mock_get.return_value = {
@@ -197,9 +235,15 @@ def test_attach_node_keeps_non_trigger_default_for_app_node():
 
     assert result["is_trigger"] is False
     assert result["is_listener"] is False
-    new_block = next(b for b in captured["payload"]["workflow_details"]["blocks"] if b["id"] == result["node_id"])
-    assert new_block["isTrigger"] is False
-    assert new_block["isListener"] is False
+    mock_put_wf.assert_not_called()
+    pasted = captured["paste_bodies"][0]["nodes"][0]
+    assert pasted["isTrigger"] is False
+    assert pasted["isListener"] is False
+    # Single parent → exactly one put_node edge call on parent-1
+    assert len(captured["put_node_calls"]) == 1
+    parent_id, patched_parent = captured["put_node_calls"][0]
+    assert parent_id == "parent-1"
+    assert any(e["toBlockId"] == result["node_id"] for e in patched_parent["toBlocks"])
 
 
 def test_attach_node_caller_override_wins():
@@ -208,14 +252,12 @@ def test_attach_node_caller_override_wins():
     from nrev_wf_mcp.server import attach_node
 
     _lookup_node_def_flags.cache_clear()
-    captured = {}
-
-    def fake_put(wf_id, payload):
-        captured["payload"] = payload
-        return {"blocks": payload["workflow_details"]["blocks"]}
+    captured: dict = {}
 
     with patch("nrev_wf_mcp.server.api.get_workflow") as mock_get, \
-         patch("nrev_wf_mcp.server.api.put_workflow", side_effect=fake_put), \
+         patch("nrev_wf_mcp.server.api.paste_nodes", side_effect=_mock_paste_capture(captured)), \
+         patch("nrev_wf_mcp.server.api.put_node", side_effect=_mock_put_node_capture(captured)), \
+         patch("nrev_wf_mcp.server.api.put_workflow") as mock_put_wf, \
          patch("nrev_wf_mcp.server.api.list_node_definitions") as mock_list, \
          patch("nrev_wf_mcp.server._maybe_validate", return_value=None):
         mock_get.return_value = {
@@ -238,3 +280,7 @@ def test_attach_node_caller_override_wins():
 
     assert result["is_trigger"] is False
     assert result["is_listener"] is False
+    mock_put_wf.assert_not_called()
+    pasted = captured["paste_bodies"][0]["nodes"][0]
+    assert pasted["isTrigger"] is False
+    assert pasted["isListener"] is False

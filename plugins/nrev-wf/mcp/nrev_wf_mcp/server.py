@@ -537,6 +537,126 @@ def validate_custom_code(code: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Build helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _rewrite_block_id(block: dict, old_id: str, new_id: str) -> dict:
+    """Return a deep copy of `block` with every occurrence of `old_id` replaced
+    by `new_id`. Used to repair internal self-references after paste-nodes
+    reassigns the platform-side block id.
+
+    Affects every field that may carry a self-reference:
+      - block.id
+      - block.outputs[].node_id
+      - block.outputs[].columns_metadata[].origin_node_id
+      - block.settings_field_values (Magic Node references include the new_id
+        inside edge-id-shaped strings like `parent-_default-NEW-df1`)
+
+    Implementation is a JSON round-trip with string replacement. UUIDs are
+    122 bits of entropy — collisions with unrelated substrings are not a
+    real concern in practice.
+    """
+    import json
+    s = json.dumps(block)
+    s = s.replace(old_id, new_id)
+    return json.loads(s)
+
+
+def _attach_block_via_paste_and_wire(
+    *,
+    workflow_id: str,
+    new_block: dict,
+    parent_edges: list[tuple[str, str, str]],
+    fallback_parents: dict[str, dict],
+    existing_block_ids: set[str],
+) -> tuple[dict, str]:
+    """Add `new_block` to a workflow and wire `parent_edges` into it, using
+    small-payload endpoints only:
+
+      1. POST /workflows/{id}/paste-nodes with `{"nodes": [new_block]}` —
+         typically 1–3 KB regardless of how big the workflow already is.
+         **The platform reassigns the block id**, ignoring the one we send.
+         We detect the new id by diffing the response against
+         `existing_block_ids` (the only id present after that wasn't before
+         IS our newly-created block).
+      2. If our internal self-references (outputs.node_id, columns_metadata
+         origin_node_id, Magic Node refs) need updating to match the
+         reassigned id, PUT a corrected copy of the new block via
+         `put_node` — still 2–3 KB, irrelevant to workflow size.
+      3. For each (parent_id, source_handle, target_handle) in `parent_edges`,
+         PUT /workflows/{id}/nodes/{parent_id} with the parent's full block +
+         the new edge appended (referencing the reassigned id, not our
+         local UUID). Usually 2–5 KB per parent.
+
+    Why this matters: prior versions did a single full `PUT /workflows/{id}`
+    that re-sent every existing block. On workflows past ~50 blocks the body
+    routinely exceeded the platform's request-size limit (HTTP 413). This
+    helper avoids the giant PUT entirely.
+
+    Returns:
+      (paste_response, actual_block_id) — the actual_block_id is the
+      platform-assigned UUID, NOT the one in `new_block["id"]`. Callers
+      should use it for any downstream operations (return value, edge
+      lookups, etc.).
+
+    Raises if any parent is missing from `fallback_parents`, or if the
+    paste-nodes response doesn't contain exactly one new block.
+    """
+    paste_resp = api.paste_nodes(workflow_id, {"nodes": [new_block]})
+    response_ids = {b.get("id") for b in (paste_resp.get("blocks") or []) if b.get("id")}
+    new_ids = response_ids - existing_block_ids
+    if len(new_ids) != 1:
+        raise RuntimeError(
+            f"paste-nodes response had {len(new_ids)} new block ids (expected 1). "
+            f"Cannot determine which block to wire edges to. "
+            f"Diff: {sorted(new_ids)}"
+        )
+    actual_id = new_ids.pop()
+    original_id = new_block["id"]
+
+    # If the platform reassigned our id, PUT a corrected copy so all
+    # self-references (outputs.node_id, columns_metadata.origin_node_id, Magic
+    # Node refs) line up with the new id. Skip the PUT if id matches — that
+    # would be wasted bandwidth.
+    if actual_id != original_id:
+        fixed_block = _rewrite_block_id(new_block, original_id, actual_id)
+        api.put_node(workflow_id, actual_id, fixed_block)
+
+    for parent_id, source_handle, target_handle in parent_edges:
+        parent = fallback_parents.get(parent_id)
+        if parent is None:
+            raise ValueError(
+                f"parent {parent_id} not present in workflow snapshot — "
+                f"refusing to wire an edge from an unknown parent."
+            )
+        edges = parent.get("toBlocks") or []
+        already = any(
+            e.get("toBlockId") == actual_id
+            and e.get("edge_target_handle_condition") == target_handle
+            for e in edges
+        )
+        if not already:
+            edges.append({
+                "edgeId": f"{parent_id}-{source_handle}-{actual_id}-{target_handle}",
+                "edge_source_handle_condition": source_handle,
+                "edge_target_handle_condition": target_handle,
+                "toBlockId": actual_id,
+            })
+            parent["toBlocks"] = edges
+            api.put_node(workflow_id, parent_id, parent)
+    return paste_resp, actual_id
+
+
+def _new_block_error_from_paste(paste_resp: dict, new_id: str) -> Optional[str]:
+    """Read `node_config_error` for our newly-pasted block from the paste-nodes
+    response. The response echoes the full workflow; we just need our block."""
+    for b in (paste_resp.get("blocks") or []):
+        if b.get("id") == new_id:
+            return b.get("node_config_error")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Build
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -740,43 +860,27 @@ def attach_magic_node(
         "node_config_error": None,
     }
 
-    # Add the df{N} edges to each parent (idempotent — won't duplicate).
-    for i, pid in enumerate(parent_node_ids):
-        parent = blocks_by_id[pid]
-        edges = parent.get("toBlocks") or []
-        target_handle = f"df{i + 1}"
-        already = any(
-            e.get("toBlockId") == new_id
-            and e.get("edge_target_handle_condition") == target_handle
-            for e in edges
-        )
-        if not already:
-            edges.append({
-                "edgeId": f"{pid}-_default-{new_id}-{target_handle}",
-                "edge_source_handle_condition": "_default",
-                "edge_target_handle_condition": target_handle,
-                "toBlockId": new_id,
-            })
-        parent["toBlocks"] = edges
-
-    all_blocks = wf["blocks"] + [new_block]
-    payload = {"workflow_details": {
-        "id": workflow_id,
-        "name": wf.get("name"),
-        "description": wf.get("description"),
-        "blocks": all_blocks,
-    }}
-    resp = api.put_workflow(workflow_id, payload)
-
-    err = None
-    for b in resp.get("blocks", []):
-        if b["id"] == new_id:
-            err = b.get("node_config_error")
-            break
+    # Small-payload path (v0.2.8): see attach_node for rationale. Magic Node
+    # uses df1..dfN target handles, one per parent index, source handle is
+    # always _default. The Magic Node references field carries strings that
+    # embed `new_id` — those get rewritten in the helper's id-fixup PUT after
+    # paste-nodes returns the platform-assigned id.
+    parent_edges = [
+        (pid, "_default", f"df{i + 1}")
+        for i, pid in enumerate(parent_node_ids)
+    ]
+    resp, actual_new_id = _attach_block_via_paste_and_wire(
+        workflow_id=workflow_id,
+        new_block=new_block,
+        parent_edges=parent_edges,
+        fallback_parents=blocks_by_id,
+        existing_block_ids={b["id"] for b in wf["blocks"]},
+    )
+    err = _new_block_error_from_paste(resp, actual_new_id)
 
     return {
         "ok": err is None,
-        "node_id": new_id,
+        "node_id": actual_new_id,
         "node_config_error": err,
         "workflowConfigError": resp.get("workflowConfigError"),
         "isRunable": resp.get("isRunable"),
@@ -907,35 +1011,19 @@ def attach_python_block(
         "node_config_error": None,
     }
 
-    # Add edge from parent → new block (idempotent: skip if already present).
-    parent_edges = parent.get("toBlocks") or []
-    if not any(e.get("toBlockId") == new_id for e in parent_edges):
-        parent_edges.append({
-            "edgeId": f"{parent_node_id}-_default-{new_id}-_default",
-            "edge_source_handle_condition": "_default",
-            "edge_target_handle_condition": "_default",
-            "toBlockId": new_id,
-        })
-    parent["toBlocks"] = parent_edges
-
-    all_blocks = wf["blocks"] + [new_block]
-    payload = {"workflow_details": {
-        "id": workflow_id,
-        "name": wf.get("name"),
-        "description": wf.get("description"),
-        "blocks": all_blocks,
-    }}
-    resp = api.put_workflow(workflow_id, payload)
-
-    err = None
-    for b in resp.get("blocks", []):
-        if b["id"] == new_id:
-            err = b.get("node_config_error")
-            break
+    # Small-payload path (v0.2.8): see attach_node for rationale.
+    resp, actual_new_id = _attach_block_via_paste_and_wire(
+        workflow_id=workflow_id,
+        new_block=new_block,
+        parent_edges=[(parent_node_id, "_default", "_default")],
+        fallback_parents={parent_node_id: parent},
+        existing_block_ids={b["id"] for b in wf["blocks"]},
+    )
+    err = _new_block_error_from_paste(resp, actual_new_id)
 
     return {
         "ok": err is None,
-        "node_id": new_id,
+        "node_id": actual_new_id,
         "node_config_error": err,
         "workflowConfigError": resp.get("workflowConfigError"),
         "isRunable": resp.get("isRunable"),
@@ -2938,32 +3026,24 @@ def attach_node(
         "node_config_error": None,
     }
 
-    # Wire edges from each parent
-    for pid in parent_node_ids:
-        parent = blocks_by_id[pid]
-        edges = parent.get("toBlocks") or []
-        if not any(e.get("toBlockId") == new_id for e in edges):
-            edges.append({
-                "edgeId": f"{pid}-_default-{new_id}-_default",
-                "edge_source_handle_condition": "_default",
-                "edge_target_handle_condition": "_default",
-                "toBlockId": new_id,
-            })
-        parent["toBlocks"] = edges
-
-    all_blocks = wf["blocks"] + [new_block]
-    payload = {"workflow_details": {
-        "id": workflow_id,
-        "name": wf.get("name"),
-        "description": wf.get("description"),
-        "blocks": all_blocks,
-    }}
-    resp = api.put_workflow(workflow_id, payload)
-
-    err = next((b.get("node_config_error") for b in resp.get("blocks", []) if b["id"] == new_id), None)
+    # Small-payload path (v0.2.8): paste-nodes for the new block, then put_node
+    # on each parent to wire the edge. Avoids the full-workflow PUT that
+    # silently breaks on workflows past ~50 blocks (HTTP 413, request too big).
+    # paste-nodes reassigns our locally-generated UUID; the helper diffs the
+    # response against existing block IDs to find the actual platform-assigned
+    # id and returns it.
+    parent_edges = [(pid, "_default", "_default") for pid in parent_node_ids]
+    resp, actual_new_id = _attach_block_via_paste_and_wire(
+        workflow_id=workflow_id,
+        new_block=new_block,
+        parent_edges=parent_edges,
+        fallback_parents=blocks_by_id,
+        existing_block_ids={b["id"] for b in wf["blocks"]},
+    )
+    err = _new_block_error_from_paste(resp, actual_new_id)
     return {
         "ok": err is None,
-        "node_id": new_id,
+        "node_id": actual_new_id,
         "type_id": type_id,
         "name": name,
         "node_config_error": err,
