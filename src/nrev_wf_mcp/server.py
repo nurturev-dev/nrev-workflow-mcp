@@ -5,6 +5,7 @@ Run with:  python -m nrev_wf_mcp.server   (or via the `nrev-wf-mcp` entrypoint)
 from __future__ import annotations
 
 import ast
+import functools
 import uuid
 from typing import Optional
 
@@ -2732,6 +2733,37 @@ def _resolve_field_label(
 # Generic build (any node type) + workflow duplication — v0.2.5
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Cache node-def flags for the duration of the server process. The catalog is
+# static within a server lifetime, so each typeId is looked up at most once.
+@functools.lru_cache(maxsize=256)
+def _lookup_node_def_flags(type_id: str) -> tuple[Optional[bool], Optional[bool]]:
+    """Look up (is_trigger, is_listener) for a given typeId from the node-def
+    catalog. Returns (None, None) if the typeId can't be found or the lookup
+    errors — the caller treats that as "fall back to safe defaults".
+
+    The platform exposes both flags per definition (`is_trigger` snake_case,
+    `isListener` camelCase — yes, mixed). Both must be True on the block for
+    a scheduler-like node to actually drive the live toggle in the UI: the
+    trigger flag alone is necessary but not sufficient.
+    """
+    PAGE = 100
+    try:
+        for offset in range(0, 600, PAGE):
+            raw = api.list_node_definitions(limit=PAGE, offset=offset)
+            items = (raw.get("data") if isinstance(raw, dict) else []) or []
+            match = next((n for n in items if n.get("node_definition_id") == type_id), None)
+            if match:
+                return (
+                    bool(match.get("is_trigger")),
+                    bool(match.get("isListener")),
+                )
+            if not items or len(items) < PAGE:
+                break
+    except Exception:
+        pass
+    return (None, None)
+
+
 @mcp.tool()
 def attach_node(
     workflow_id: str,
@@ -2744,7 +2776,8 @@ def attach_node(
     position_y: Optional[float] = None,
     output_columns: Optional[list[str]] = None,
     output_dtypes: Optional[list[str]] = None,
-    is_trigger: bool = False,
+    is_trigger: Optional[bool] = None,
+    is_listener: Optional[bool] = None,
     credit_cost_per_item: int = 0,
     field_labels: Optional[dict] = None,
     auto_resolve_labels: bool = True,
@@ -2761,8 +2794,13 @@ def attach_node(
     settings as the platform expects (typically a field like
     `pipedream-<app>-<action>-connectionId`).
 
-    `parent_node_ids` can be empty for trigger nodes (Scheduler etc.) — in
-    that case set `is_trigger=True` and the new node will be wired as a root.
+    `parent_node_ids` can be empty for trigger nodes (Scheduler etc.). When
+    `is_trigger` / `is_listener` are left as their defaults (None), this tool
+    looks up the node-definition catalog and sets both flags automatically —
+    so attaching a Scheduler with no parents produces a real trigger that the
+    workflow's "Go Live" toggle accepts, with no extra ceremony required from
+    the caller. Override either flag explicitly (True/False) only when you
+    know the catalog default is wrong for your use case.
 
     `output_columns` is optional. Most app-backed nodes don't need explicit
     output schema (the platform fills it in from the node definition); supply
@@ -2803,6 +2841,19 @@ def attach_node(
 
     new_id = str(uuid.uuid4())
     type_slug = _typeid_to_value_slug(type_id)
+
+    # ── Resolve isTrigger / isListener ──────────────────────────────────────
+    # If the caller left either flag as None, consult the node-definition
+    # catalog. The Scheduler (and any other trigger-capable type) needs BOTH
+    # isTrigger=true AND isListener=true on the block for the workflow's
+    # "Go Live" toggle to work; setting only one silently leaves the workflow
+    # in draft and shows the misleading "Add a Trigger Node" tooltip.
+    auto_trigger: Optional[bool] = None
+    auto_listener: Optional[bool] = None
+    if is_trigger is None or is_listener is None:
+        auto_trigger, auto_listener = _lookup_node_def_flags(type_id)
+    resolved_is_trigger = is_trigger if is_trigger is not None else (auto_trigger or False)
+    resolved_is_listener = is_listener if is_listener is not None else (auto_listener or False)
 
     # Position: 400 px right of rightmost parent (or origin for triggers)
     if parent_node_ids:
@@ -2870,10 +2921,10 @@ def attach_node(
         "variableName": name,
         "description": description,
         "settings_field_values": settings_field_values,
-        "isTrigger": is_trigger,
+        "isTrigger": resolved_is_trigger,
         "isOrphan": False,
         "isPartOfActiveSwimlane": True,
-        "isListener": False,
+        "isListener": resolved_is_listener,
         "isTestMode": False,
         "inputs": [{
             "columns": [], "columns_metadata": None, "file": "",
@@ -2918,6 +2969,8 @@ def attach_node(
         "node_config_error": err,
         "workflowConfigError": resp.get("workflowConfigError"),
         "isRunable": resp.get("isRunable"),
+        "is_trigger": resolved_is_trigger,   # final value applied to the block
+        "is_listener": resolved_is_listener,  # final value applied to the block
         "resolved_labels": resolved_labels,  # which dropdown fields got auto-resolved
         "explicit_labels": list(field_labels.keys()),  # which were caller-supplied
         "validation": _maybe_validate(workflow_id, validate_after),
