@@ -2554,6 +2554,180 @@ def list_connection_apps(
     }
 
 
+@mcp.tool()
+def list_field_options(
+    workflow_id: str,
+    node_id: str,
+    field_name: str,
+    search: Optional[str] = None,
+) -> dict:
+    """Fetch the dropdown options for a single field on a node.
+
+    This is what the platform's UI calls when populating dropdowns. For
+    cascading fields (e.g. worksheetId depends on sheetId), the prerequisite
+    settings on the node must be set first; the platform reads them to scope
+    the options.
+
+    Use cases:
+      - Discover sheets / worksheets / channels / folders available for an
+        app-backed node before configuring it
+      - Resolve a value back to its human-readable label (e.g. UUID → name)
+      - Search a large option list (passes `search` through to the API)
+
+    Returns: {field_name, count, options: [{label, value}], errors}
+    """
+    wf = api.get_workflow(workflow_id)
+    target = next((b for b in wf["blocks"] if b["id"] == node_id), None)
+    if target is None:
+        raise ValueError(f"node {node_id} not in workflow {workflow_id}")
+
+    settings_array = _settings_as_value_array(target.get("settings_field_values") or [])
+    resp = api.field_options(
+        node_id=node_id,
+        node_definition_id=target.get("typeId", ""),
+        field_name=field_name,
+        settings=settings_array,
+        search=search,
+    )
+    opts = resp.get("options") or []
+    return {
+        "field_name": field_name,
+        "count": len(opts),
+        "options": [{"label": o.get("label"), "value": o.get("value")} for o in opts],
+        "errors": resp.get("errors") or [],
+    }
+
+
+def _settings_as_value_array(settings_field_values: list[dict]) -> list[dict]:
+    """Flatten settings_field_values (which carry the full envelope) into the
+    simple `[{field_name, field_value}, ...]` shape the field-options endpoint
+    expects in its `settings` body parameter.
+
+    Recurses into group entries (where field_value is itself a list of dicts).
+    Group entries themselves are omitted; only leaf fields are emitted.
+    """
+    out: list[dict] = []
+    for entry in (settings_field_values or []):
+        name = entry.get("field_name")
+        if not name:
+            continue
+        val = entry.get("field_value")
+        is_group = isinstance(val, list) and val and all(
+            isinstance(x, dict) and "field_name" in x for x in val
+        )
+        if is_group:
+            out.extend(_settings_as_value_array(val))
+        else:
+            out.append({"field_name": name, "field_value": val})
+    return out
+
+
+# Suffixes that indicate a dropdown-like field whose value is an ID/UUID and
+# whose label would be helpful to resolve. Used by attach_node when
+# auto_resolve_labels is True.
+_AUTO_RESOLVE_LABEL_SUFFIXES = (
+    "connection_id",
+    "connectionid",
+    "connectionId",
+    "sheetId",
+    "worksheetId",
+    "folderId",
+    "channelId",
+    "userId",
+    "calendarId",
+    "boardId",
+    "spaceId",
+    "tableId",
+    "baseId",
+    "groupId",
+    "teamId",
+    "projectId",
+    "pipelineId",
+    "campaignId",
+)
+
+
+def _looks_like_dropdown_field(field_name: str) -> bool:
+    """Heuristic: does this field look like an ID-valued dropdown whose label
+    would be a human-readable name? Match on the trailing segment of the
+    dot/dash-separated field name."""
+    if not field_name:
+        return False
+    last = field_name.rsplit("-", 1)[-1]
+    return any(last.endswith(suf) for suf in _AUTO_RESOLVE_LABEL_SUFFIXES)
+
+
+def _is_connection_id_field(field_name: str) -> bool:
+    """connection_id is a special case: field-options can't resolve it
+    (the endpoint needs a connection to fetch options FOR a connection field,
+    which is circular). Resolve via list_connections() instead."""
+    if not field_name:
+        return False
+    last = field_name.rsplit("-", 1)[-1].lower()
+    return last.endswith("connection_id") or last.endswith("connectionid")
+
+
+def _resolve_connection_label(target_value) -> Optional[str]:
+    """Look up a connection's friendly name from its connection_id."""
+    if not target_value:
+        return None
+    try:
+        conns = api.list_connections() or []
+    except Exception:
+        return None
+    target_str = str(target_value)
+    for c in conns:
+        if c.get("connectionId") == target_str:
+            return c.get("connectionName") or c.get("appName")
+    return None
+
+
+def _resolve_field_label(
+    *,
+    node_id: str,
+    type_id: str,
+    field_name: str,
+    target_value,
+    settings_array: list[dict],
+) -> Optional[str]:
+    """Look up the human-readable label for a field value.
+
+    Routing:
+      - connection_id fields → resolve via list_connections() (the
+        field-options endpoint can't help — circular dependency)
+      - everything else → resolve via the field-options endpoint
+
+    Returns the matching label, or None if no match / if the lookup errors.
+    Failures are silent so a partial-resolution doesn't block attach_node.
+    """
+    if target_value is None or target_value == "":
+        return None
+
+    if _is_connection_id_field(field_name):
+        return _resolve_connection_label(target_value)
+
+    try:
+        resp = api.field_options(
+            node_id=node_id,
+            node_definition_id=type_id,
+            field_name=field_name,
+            settings=settings_array,
+        )
+    except Exception:
+        return None
+    target_str = str(target_value)
+    for opt in (resp.get("options") or []):
+        opt_val = opt.get("value")
+        # Match on stringified value. The endpoint sometimes returns floats
+        # for numeric IDs (e.g. worksheetId=410711210.0); the block stores
+        # strings ("410711210"). Compare flexibly.
+        if str(opt_val) == target_str:
+            return opt.get("label")
+        if isinstance(opt_val, float) and opt_val.is_integer() and str(int(opt_val)) == target_str:
+            return opt.get("label")
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Generic build (any node type) + workflow duplication — v0.2.5
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2572,6 +2746,8 @@ def attach_node(
     output_dtypes: Optional[list[str]] = None,
     is_trigger: bool = False,
     credit_cost_per_item: int = 0,
+    field_labels: Optional[dict] = None,
+    auto_resolve_labels: bool = True,
     validate_after: bool = True,
 ) -> dict:
     """Generic block-attach for ANY node type (Scheduler, Gmail, Calendar, AI, etc.).
@@ -2591,6 +2767,28 @@ def attach_node(
     `output_columns` is optional. Most app-backed nodes don't need explicit
     output schema (the platform fills it in from the node definition); supply
     it only when the platform validator complains.
+
+    `field_labels` (optional): explicit {field_name: human_label} map. Useful
+    when you already know the labels (e.g. copied from another node). Values
+    here take precedence over auto-resolution.
+
+    `auto_resolve_labels` (default True): for each setting whose field_name
+    looks like a dropdown (ends in `_connection_id`, `sheetId`, `worksheetId`,
+    `channelId`, `folderId`, etc.) AND has no explicit label, call the
+    platform's field-options endpoint to resolve the value to its human
+    label. This is what makes the UI dropdowns show "Competitive tracking"
+    instead of a raw spreadsheet UUID. Adds ~1 extra API call per dropdown
+    field. Failures are silent (label stays None) — doesn't block attach.
+
+    KNOWN AUTO-RESOLVE LIMITATIONS — pass via `field_labels` when these hit:
+      - connection_id fields can only be auto-resolved for connections owned
+        by the JWT caller. In multi-user tenants, if you're reusing a
+        teammate's OAuth connection (e.g. their Google Sheets), the platform
+        returns no visibility into other users' connections — pass the label
+        explicitly.
+      - Some Pipedream dropdowns require prerequisite settings (e.g.
+        worksheetId needs sheetId set first). Auto-resolve sends ALL settings
+        as context so cascading works, but exotic chains may need manual help.
     """
     if not type_id:
         raise ValueError("type_id is required (use list_node_definitions to find it)")
@@ -2617,8 +2815,31 @@ def attach_node(
         if position_x is None: position_x = 100
         if position_y is None: position_y = -100
 
-    # Settings — wrap each field in the platform's _sf envelope
-    settings_field_values = [_sf(name=k, value=v) for k, v in settings.items()]
+    # ── Resolve fieldLabels per setting ─────────────────────────────────────
+    # Precedence: explicit field_labels > auto-resolve via field-options > None
+    field_labels = dict(field_labels or {})
+    settings_array_for_options = [{"field_name": k, "field_value": v} for k, v in settings.items()]
+    resolved_labels: dict[str, str] = {}
+    if auto_resolve_labels:
+        for fname, fvalue in settings.items():
+            if fname in field_labels:
+                continue  # caller already provided
+            if not _looks_like_dropdown_field(fname):
+                continue
+            label = _resolve_field_label(
+                node_id=new_id, type_id=type_id, field_name=fname,
+                target_value=fvalue, settings_array=settings_array_for_options,
+            )
+            if label:
+                resolved_labels[fname] = label
+
+    # Settings — wrap each field in the platform's _sf envelope; attach label if known
+    def _label_for(fname: str) -> Optional[str]:
+        if fname in field_labels:
+            return field_labels[fname]
+        return resolved_labels.get(fname)
+
+    settings_field_values = [_sf(name=k, value=v, label=_label_for(k)) for k, v in settings.items()]
 
     # Outputs — only set columns_metadata if caller specified columns
     if output_columns:
@@ -2697,6 +2918,8 @@ def attach_node(
         "node_config_error": err,
         "workflowConfigError": resp.get("workflowConfigError"),
         "isRunable": resp.get("isRunable"),
+        "resolved_labels": resolved_labels,  # which dropdown fields got auto-resolved
+        "explicit_labels": list(field_labels.keys()),  # which were caller-supplied
         "validation": _maybe_validate(workflow_id, validate_after),
     }
 

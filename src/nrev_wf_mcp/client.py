@@ -141,6 +141,36 @@ def list_connections() -> list:
     return request("GET", "/connections")
 
 
+def field_options(
+    node_id: str,
+    node_definition_id: str,
+    field_name: str,
+    settings: list[dict],
+    search: Optional[str] = None,
+) -> dict:
+    """POST /nodes/field-options — fetch dropdown options for one field.
+
+    This is what the platform's UI calls when populating dropdowns. For
+    cascading dropdowns (like worksheetId depending on sheetId), include
+    the prerequisite settings in `settings` so the platform can resolve.
+
+    Returns {options: [{label, value}], nodeId, fieldName, errors, search, context}.
+
+    NOTE: `nodeId` is for logging only — can be any UUID, no need to point
+    at a real existing node. Use the about-to-be-created node's UUID for
+    fresh attach flows.
+    """
+    body = {
+        "nodeId": node_id,
+        "nodeDefinitionId": node_definition_id,
+        "fieldName": field_name,
+        "settings": settings or [],
+    }
+    if search is not None:
+        body["search"] = search
+    return request("POST", "/nodes/field-options", json_body=body)
+
+
 def list_connection_apps(
     limit: int = 50,
     offset: int = 0,
