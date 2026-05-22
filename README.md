@@ -1,10 +1,10 @@
 # nrev-workflow-mcp
 
-A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow API as **40 MCP tools** — build, debug, and operate workflows from inside any Claude session.
+A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow API as **45 MCP tools** — build, debug, and operate workflows from inside any Claude session.
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.11** ([release notes](#release-notes)).
+Current version: **v0.2.12** ([release notes](#release-notes)).
 
 ---
 
@@ -17,7 +17,7 @@ In any Claude Code session:
 /plugin install nrev-wf@nrev
 ```
 
-Restart Claude Code. Run `/mcp` and you should see `nrev-wf` with 40 tools.
+Restart Claude Code. Run `/mcp` and you should see `nrev-wf` with 45 tools.
 
 ### Prerequisites (one-time)
 
@@ -47,7 +47,7 @@ JWTs last 12 hours and live in the plugin's process memory only.
 /plugin update nrev-wf
 ```
 
-Then **fully quit and reopen Claude Code** so the MCP server respawns under the new version. Verify with `/mcp` (tool count should be 40 on v0.2.6+).
+Then **fully quit and reopen Claude Code** so the MCP server respawns under the new version. Verify with `/mcp` (tool count should be 45 on v0.2.12+).
 
 If `/plugin update` doesn't see the new version, force-refresh the marketplace cache:
 
@@ -162,17 +162,18 @@ nrev-workflow-mcp/
 
 ---
 
-## Tools (40)
+## Tools (45)
 
 | Group | Tools |
 |---|---|
-| **Auth** | `set_jwt`, `get_auth_status` |
+| **Auth & billing** | `set_jwt`, `get_auth_status`, `get_credit_balance` |
 | **Read / inspect** | `get_workflow`, `list_workflows`, `get_node`, `get_workflow_graph`, `list_node_settings`, `get_node_neighbors`, `trace_path` |
 | **Discovery** | `list_node_definitions`, `get_node_definition`, `list_connections`, `list_connection_apps`, `list_field_options` |
 | **Validate** | `validate_workflow`, `validate_custom_code` |
 | **Build** | `create_workflow`, `attach_node`, `attach_magic_node`, `attach_python_block`, `paste_nodes`, `duplicate_workflow`, `clone_node` |
 | **Edit** | `update_node_setting`, `update_magic_node`, `update_ai_prompt`, `set_node_output_schema` |
 | **Wiring** | `add_edge`, `remove_edge`, `delete_node`, `splice_branch` |
+| **Sticky notes** | `list_sticky_notes`, `add_sticky_note`, `update_sticky_note`, `delete_sticky_note` |
 | **Run / monitor** | `list_executions`, `get_execution`, `get_node_output`, `partial_execute`, `tail_execution`, `abort_execution` |
 | **Test mode** | `set_test_mode`, `bulk_set_test_mode` |
 | **Diagnostics** | `dry_run_cost` |
@@ -224,6 +225,14 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.12 — credit balance + sticky notes
+- New `get_credit_balance` tool — surfaces the active tenant's nRev credit balance as a plain integer. Tenant is resolved server-side from the JWT, so no parameter needed; useful as a sanity check before kicking off credit-heavy runs or when juggling multiple tenants (one Claude Code session per tenant, see [Multi-tenant pattern](#multi-tenant-pattern)).
+- New sticky-note tools: `list_sticky_notes`, `add_sticky_note`, `update_sticky_note`, `delete_sticky_note`. Sticky notes are workflow-level annotations (the colored notes you drop on the canvas). Plain-text in, Tiptap JSON wrapping handled internally. Useful for documenting swimlanes, flagging review items, calling out known limitations — without touching node settings.
+- Two API gotchas the OpenAPI spec doesn't warn about, encoded in the wrapper for free:
+  - The PATCH body field is `stickyNotes` (camelCase), NOT the `sticky_notes` (snake_case) shown in the published schema. Live-confirmed both shapes; only camelCase is accepted.
+  - `tenant_id` in the credit-balance path is *ignored* — server resolves tenant from the JWT. So passing 0 works for everyone.
+- Tool count: 40 → 45.
 
 ### v0.2.11 — single-input guard in `attach_node`
 - `attach_node` now refuses 2+ parents by default. Pre-v0.2.11 it silently created multiple `_default` edges into single-input nodes (HubSpot, Gmail, Sheets, Custom Code, AI — almost everything), producing workflows that looked correct in the UI but failed silently at execution.

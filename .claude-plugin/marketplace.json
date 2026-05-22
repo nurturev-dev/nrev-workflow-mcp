@@ -8,11 +8,11 @@
   "plugins": [
     {
       "name": "nrev-wf",
-      "description": "Build, debug, and operate nRev workflows from Claude — 40 tools wrapping the nRev workflow API. Per-user JWT auth, no secrets bundled.",
+      "description": "Build, debug, and operate nRev workflows from Claude — 45 tools wrapping the nRev workflow API. Per-user JWT auth, no secrets bundled.",
       "source": "./plugins/nrev-wf",
       "category": "productivity",
       "keywords": ["nrev", "workflow", "gtm", "mcp"],
-      "version": "0.2.11"
+      "version": "0.2.12"
     }
   ]
 }

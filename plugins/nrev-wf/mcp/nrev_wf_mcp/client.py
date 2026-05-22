@@ -289,3 +289,43 @@ def get_node_preview(
         f"/executions/workflow/{wf_id}/workflow-execution/{exec_id}/node/{node_id}/preview",
         params={"handle_condition": handle_condition, "skip": skip, "limit": limit},
     )
+
+
+def credit_balance(tenant_id: int = 0) -> int:
+    """GET /credit-management/tenant/{tenant_id}/balance — returns the credit
+    balance as a plain integer.
+
+    NOTE: the `tenant_id` in the path is IGNORED by the server. The tenant is
+    resolved from the JWT, so passing 0 works for any caller. We accept the
+    arg only for documentation symmetry with the platform's path shape.
+    """
+    return request("GET", f"/credit-management/tenant/{int(tenant_id)}/balance")
+
+
+def patch_workflow_no_validation(
+    wf_id: str,
+    *,
+    name: Optional[str] = None,
+    sticky_notes: Optional[list[dict]] = None,
+) -> dict:
+    """PATCH /workflows/{wf}/no-validation — update workflow-level metadata
+    (name, sticky notes) without triggering full workflow validation.
+
+    Two gotchas the OpenAPI doesn't warn about:
+      1. The body field is `stickyNotes` (camelCase), NOT `sticky_notes` despite
+         what the published schema says. We translate here.
+      2. The server requires at least one of `name`/`stickyNotes` to be set —
+         calling with both None returns HTTP 400.
+
+    `sticky_notes` REPLACES the entire array (it's a set, not an append). To
+    add or update a single note, fetch the workflow first, mutate the list,
+    then pass the full new list.
+    """
+    body: dict = {}
+    if name is not None:
+        body["name"] = name
+    if sticky_notes is not None:
+        body["stickyNotes"] = sticky_notes
+    if not body:
+        raise ValueError("must pass at least one of name / sticky_notes")
+    return request("PATCH", f"/workflows/{wf_id}/no-validation", json_body=body)

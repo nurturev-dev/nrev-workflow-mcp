@@ -119,6 +119,27 @@ def get_auth_status() -> dict:
     return auth.status()
 
 
+@mcp.tool()
+def get_credit_balance() -> dict:
+    """Show the tenant's current nRev credit balance.
+
+    The tenant is resolved from the active JWT — no parameter needed. Useful
+    before kicking off a credit-heavy run (or as a sanity check between
+    sessions if you're juggling multiple tenants).
+
+    Returns: {credits: <int>, note: "..."}.
+    """
+    try:
+        balance = api.credit_balance()
+    except Exception as e:
+        return {"credits": None, "error": str(e)}
+    return {
+        "credits": int(balance),
+        "note": "Tenant is resolved server-side from the JWT. To check a "
+                "different tenant, set that tenant's JWT in this session.",
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Read
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3154,6 +3175,228 @@ def duplicate_workflow(
         "new_workflow_id": resp.get("id"),
         "new_workflow_name": resp.get("name"),
         "version": resp.get("version"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Sticky notes (workflow-level annotations) — v0.2.12
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Default visual settings — match what the UI uses when you drop a new note.
+_DEFAULT_STICKY_SIZE = {"width": 240.0, "height": 160.0}
+_DEFAULT_STICKY_COLOR = "#FFEB3B"   # yellow
+_DEFAULT_STICKY_COLOR_MODE = "background"  # one of: background, transparent, border
+
+
+def _text_to_tiptap_content(text: str) -> dict:
+    """Wrap a plain-text string in the Tiptap/ProseMirror JSON shape that the
+    workflow editor's sticky-note renderer expects.
+
+    Newlines split into separate paragraphs. Empty input produces an empty doc.
+
+    The platform stores `content` as opaque JSON (additionalProperties: true on
+    the schema). Sending `{"text": "..."}` is accepted on the wire but renders
+    blank in the UI because the renderer treats `content` as a Tiptap doc.
+    """
+    if not text:
+        return {"type": "doc", "content": []}
+    paragraphs = []
+    for line in text.split("\n"):
+        if line:
+            paragraphs.append({
+                "type": "paragraph",
+                "content": [{"type": "text", "text": line}],
+            })
+        else:
+            paragraphs.append({"type": "paragraph"})
+    return {"type": "doc", "content": paragraphs}
+
+
+def _tiptap_content_to_text(content) -> str:
+    """Inverse of _text_to_tiptap_content for displaying existing notes back to
+    the caller. Walks the doc tree and joins all text runs with newlines
+    between paragraphs. Returns "" if content isn't a recognized shape.
+    """
+    if not isinstance(content, dict):
+        return ""
+    # If the caller stored a non-tiptap shape (e.g. {"text": "..."}), surface
+    # what we can.
+    if "text" in content and isinstance(content["text"], str):
+        return content["text"]
+    lines: list[str] = []
+    for block in (content.get("content") or []):
+        if block.get("type") == "paragraph":
+            runs = block.get("content") or []
+            line = "".join(r.get("text", "") for r in runs if isinstance(r, dict))
+            lines.append(line)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_sticky_notes(workflow_id: str) -> dict:
+    """List the sticky notes (workflow-level annotations) on a workflow.
+
+    Returns: {count, notes: [{id, text, position, size, color, colorMode, zIndex}]}.
+    `text` is the readable form of each note's Tiptap content; the original
+    Tiptap doc is preserved under `content` for callers who want full
+    fidelity (formatting, multiple runs per paragraph, etc.).
+    """
+    wf = api.get_workflow(workflow_id)
+    raw = wf.get("stickyNotes") or []
+    notes = [
+        {
+            "id": n.get("id"),
+            "text": _tiptap_content_to_text(n.get("content")),
+            "content": n.get("content"),
+            "position": n.get("position"),
+            "size": n.get("size"),
+            "color": n.get("color"),
+            "colorMode": n.get("colorMode"),
+            "zIndex": n.get("zIndex"),
+        }
+        for n in raw
+    ]
+    return {"count": len(notes), "notes": notes}
+
+
+@mcp.tool()
+def add_sticky_note(
+    workflow_id: str,
+    text: str,
+    position_x: float = 100.0,
+    position_y: float = 100.0,
+    width: float = 240.0,
+    height: float = 160.0,
+    color: str = "#FFEB3B",
+    color_mode: str = "background",
+    z_index: int = 0,
+) -> dict:
+    """Add a sticky note to a workflow. `text` is plain text; newlines become
+    separate paragraphs in the rendered note.
+
+    Use this for documentation: explain what a swimlane does, mark a node as
+    "needs review", call out a known limitation. The note lives on the
+    workflow canvas, not on any specific node.
+
+    `color` is a hex code (e.g. "#FFEB3B" yellow, "#80DEEA" cyan,
+    "#F8BBD0" pink). `color_mode` is one of: background, transparent, border.
+
+    Returns the new note's id + a refreshed list of all notes on the workflow.
+
+    NOTE: writes via PATCH /workflows/{id}/no-validation which REPLACES the
+    sticky-notes array server-side. We fetch current notes first, append,
+    and PATCH the full list back — so concurrent edits from the UI could
+    in principle race. In practice sticky notes are slow-moving so this
+    isn't a real concern, but worth knowing.
+    """
+    if color_mode not in ("background", "transparent", "border"):
+        raise ValueError(
+            f"color_mode must be one of: background, transparent, border. "
+            f"Got: {color_mode!r}"
+        )
+
+    wf = api.get_workflow(workflow_id)
+    existing = wf.get("stickyNotes") or []
+
+    new_note = {
+        "id": str(uuid.uuid4()),
+        "position": {"x": float(position_x), "y": float(position_y)},
+        "size": {"width": float(width), "height": float(height)},
+        "content": _text_to_tiptap_content(text),
+        "color": color,
+        "colorMode": color_mode,
+        "zIndex": int(z_index),
+    }
+    updated = existing + [new_note]
+    api.patch_workflow_no_validation(workflow_id, sticky_notes=updated)
+
+    return {
+        "ok": True,
+        "note_id": new_note["id"],
+        "count": len(updated),
+        "note": "Refresh the workflow editor to see the new note.",
+    }
+
+
+@mcp.tool()
+def update_sticky_note(
+    workflow_id: str,
+    note_id: str,
+    text: Optional[str] = None,
+    position_x: Optional[float] = None,
+    position_y: Optional[float] = None,
+    width: Optional[float] = None,
+    height: Optional[float] = None,
+    color: Optional[str] = None,
+    color_mode: Optional[str] = None,
+    z_index: Optional[int] = None,
+) -> dict:
+    """Update fields on an existing sticky note. Only fields you pass are
+    changed; everything else stays as-is.
+
+    Use `list_sticky_notes(workflow_id)` first to find the note_id.
+    """
+    if color_mode is not None and color_mode not in ("background", "transparent", "border"):
+        raise ValueError(
+            f"color_mode must be one of: background, transparent, border. "
+            f"Got: {color_mode!r}"
+        )
+
+    wf = api.get_workflow(workflow_id)
+    existing = wf.get("stickyNotes") or []
+    target_idx = next((i for i, n in enumerate(existing) if n.get("id") == note_id), None)
+    if target_idx is None:
+        raise ValueError(
+            f"sticky note {note_id} not found on workflow {workflow_id}. "
+            f"Use list_sticky_notes to see available ids."
+        )
+
+    note = dict(existing[target_idx])  # shallow copy
+    if text is not None:
+        note["content"] = _text_to_tiptap_content(text)
+    if position_x is not None or position_y is not None:
+        pos = dict(note.get("position") or {"x": 0.0, "y": 0.0})
+        if position_x is not None:
+            pos["x"] = float(position_x)
+        if position_y is not None:
+            pos["y"] = float(position_y)
+        note["position"] = pos
+    if width is not None or height is not None:
+        sz = dict(note.get("size") or {"width": 240.0, "height": 160.0})
+        if width is not None:
+            sz["width"] = float(width)
+        if height is not None:
+            sz["height"] = float(height)
+        note["size"] = sz
+    if color is not None:
+        note["color"] = color
+    if color_mode is not None:
+        note["colorMode"] = color_mode
+    if z_index is not None:
+        note["zIndex"] = int(z_index)
+
+    updated = list(existing)
+    updated[target_idx] = note
+    api.patch_workflow_no_validation(workflow_id, sticky_notes=updated)
+    return {"ok": True, "note_id": note_id, "count": len(updated)}
+
+
+@mcp.tool()
+def delete_sticky_note(workflow_id: str, note_id: str) -> dict:
+    """Remove a sticky note from a workflow. Use list_sticky_notes first to
+    find the id."""
+    wf = api.get_workflow(workflow_id)
+    existing = wf.get("stickyNotes") or []
+    if not any(n.get("id") == note_id for n in existing):
+        raise ValueError(
+            f"sticky note {note_id} not found on workflow {workflow_id}."
+        )
+    updated = [n for n in existing if n.get("id") != note_id]
+    api.patch_workflow_no_validation(workflow_id, sticky_notes=updated)
+    return {
+        "ok": True,
+        "deleted_note_id": note_id,
+        "remaining_count": len(updated),
     }
 
 
