@@ -718,19 +718,25 @@ def create_workflow(name: str, description: str = "", validate_after: bool = Tru
     Three common patterns — `attach_node` handles the flag defaults
     correctly for each:
 
-      1. ONE-OFF / ad-hoc. Build a chain, run it manually with
-         `partial_execute`, throw it away (or keep it as a draft for
-         repeat manual runs). First node = start node, NOT a listener.
-         Example: `attach_node(parent_node_ids=[], type_id=<Custom Code>, ...)`
-         → wrapper auto-sets `isTrigger=True, isListener=False` because
-         Custom Code isn't listener-capable in the catalog. Workflow
-         stays in draft; no publish needed.
+      1. ONE-OFF / ad-hoc (run manually, possibly multiple times). First
+         node = a real DATA SOURCE — Google Sheets "Get Values in Range",
+         a CSV reader, a Pipedream HTTP fetch, etc. NOT a Custom Code
+         that builds a hardcoded DataFrame: the platform refuses to
+         execute parent-less Custom Code nodes with "No input data
+         provided" because root execution slots expect to receive runtime
+         input from a real source (verified live in v0.2.16 stress test).
+         Example: `attach_node(parent_node_ids=[], type_id=<Sheets Get Values in Range>, ...)`
+         → wrapper auto-sets `isTrigger=True, isListener=True` (Sheets
+         read is listener-capable in the catalog). If you only want a
+         one-shot read (no continuous polling), override with
+         `is_listener=False`. Workflow stays in draft; run via
+         `partial_execute`.
 
-      2. SCHEDULED / live. The workflow runs on its own cron. First node
-         = Scheduler. Example: `attach_node(parent_node_ids=[], type_id=<Scheduler>, ...)`
-         → wrapper auto-sets `isTrigger=True, isListener=True` because
-         Scheduler's catalog entry is listener-capable. Publish via
-         `publish_workflow` when ready (v0.2.14+).
+      2. SCHEDULED / live (cron). First node = Scheduler. Example:
+         `attach_node(parent_node_ids=[], type_id=<Scheduler>, ...)`
+         → wrapper auto-sets `isTrigger=True, isListener=True` (Scheduler
+         is listener-capable). Publish via `publish_workflow` to start
+         the cron firing.
 
       3. EVENT-DRIVEN. Webhook, Gmail new message, Slack new message.
          Same pattern as Scheduler — first node is a listener-type from
@@ -742,10 +748,19 @@ def create_workflow(name: str, description: str = "", validate_after: bool = Tru
     listener-capable root if you want a one-off run of an otherwise-
     pollable type (e.g. read a sheet once, don't keep polling).
 
-    Trigger-capable nodes attached WITH parents (Sheets "Read Output Tab"
-    used as a downstream read, etc.) are correctly NOT marked as start
-    nodes — the v0.2.13 `attach_node` fix forces both flags False when
-    parents exist, regardless of the catalog.
+    Trigger-capable nodes attached WITH parents (Sheets "Get Values in
+    Range" used as a downstream read, etc.) are correctly NOT marked as
+    start nodes — the v0.2.13 `attach_node` fix forces both flags False
+    when parents exist, regardless of the catalog.
+
+    PITFALL — CUSTOM CODE AS A ROOT: `attach_node` allows parent-empty
+    Custom Code (sets `isTrigger=True`), and validation passes (workflow
+    `isRunable=true`). But execution fails with "No input data provided"
+    because the platform engine still tries to feed the root from an
+    upstream that doesn't exist. **If you need a "pure transform" root
+    for testing, use Magic Node 1-input with a dummy upstream Sheets-read
+    or attach a single-row CSV reader.** This is a platform constraint,
+    not an MCP-side guard we can fix here.
     """
     resp = api.create_workflow(name=name, description=description)
     new_id = resp.get("id")
@@ -1189,10 +1204,17 @@ def partial_execute(
 # Treated as advisory pattern matching — the load-bearing signal is the
 # non-2xx HTTP status from api.execute_node. If a future platform release
 # changes the wording, the hint is just absent; ok=False is still returned.
+#
+# v0.2.17: added "has no trigger nodes" and "has no start nodes" — the v0.2.16
+# stress test found these are the actual most-common messages, and the original
+# three phrases (added in v0.2.13) basically never fired in practice.
 _EXECUTE_GATE_PHRASES = (
     "workflow must be executable",
     "not in a valid state to execute",
     "must be in a valid state",
+    "has no trigger nodes",
+    "has no start nodes",
+    "has no listener node",
 )
 
 
@@ -1362,7 +1384,14 @@ def set_test_mode(
                     "for no credit savings, only making downstream debugging harder."
                 ),
             }
-        api.put_node(workflow_id, node_id, {"isTestMode": on})
+        # v0.2.17: send the FULL node block with isTestMode mutated, not a
+        # partial {"isTestMode": ...} body. The platform's PUT /nodes/{id}
+        # endpoint returns HTTP 422 if id / typeId / variableName /
+        # settings_field_values / isTrigger are missing — even when those
+        # fields aren't being changed. bulk_set_test_mode already does this
+        # correctly; set_test_mode lagged.
+        target["isTestMode"] = on
+        api.put_node(workflow_id, node_id, target)
         return {"ok": True, "scope": "node", "node_id": node_id, "isTestMode": on,
                 "validation": _maybe_validate(workflow_id, validate_after)}
 
@@ -3423,12 +3452,37 @@ def paste_nodes(
     or when you have a pre-built block dict from another workflow you want
     to drop in.
 
-    `nodes` is a list of partial block dicts; the platform fills in defaults
-    from each node's typeId. Each entry should contain at minimum:
-        {"typeId": "<uuid>", "position": {"x": ..., "y": ...}}
+    `nodes` is a list of FULL block dicts. The platform's `/paste-nodes`
+    endpoint does NOT auto-fill missing fields the way "drag from palette"
+    in the UI implies — it 422s on missing fields and (worse) sometimes
+    500s on partially-malformed bodies. Required fields per node, from
+    live probing:
 
-    Optionally include "variableName", "settings_field_values" (to override
-    defaults), and any other top-level block fields.
+        id                          (UUID; platform will reassign — that's fine)
+        typeId                      (the node-definition UUID)
+        variableName                (display name)
+        description                 (can be empty string)
+        settings_field_values       (list of the platform's settings envelope —
+                                     each entry needs field_name, field_value,
+                                     fieldLabel, error, isUserInputInFormMandatory,
+                                     selectedInputTypeIndex, isStale)
+        isTrigger, isListener, isOrphan, isPartOfActiveSwimlane, isTestMode
+        inputs                      (list, can be the default skeleton)
+        outputs                     (list, can be the default skeleton)
+        toBlocks                    (list of edge dicts — empty if no outgoing edges)
+        position                    ({"x": float, "y": float})
+        creditCostPerItem           (int, 0 if free)
+        column_operations           (None ok)
+        node_config_error           (None ok)
+
+    The easiest way to get a valid block dict is to `get_node` an existing
+    block of the same typeId and mutate the fields you want to change.
+
+    The platform reassigns `id` on paste; if your block has internal
+    self-references (outputs[].node_id, columns_metadata[].origin_node_id,
+    Magic Node references), they'll point at the OLD id. Prefer
+    `attach_node` for typical use — it handles the id rewriting via
+    `_rewrite_block_id` automatically.
 
     SINGLE-INPUT GUARD (v0.2.15): mirrors the guard in `add_edge` /
     `splice_branch` / `attach_node`. If any of the pasted blocks would land
@@ -3524,10 +3578,19 @@ def duplicate_workflow(
     for a customer-specific variant, or to safely experiment without touching
     the original.
 
-    `new_name` defaults to "Copy of <original_name>".
+    `new_name` defaults to "Copy of <original_name>". If omitted, this tool
+    reads the source workflow's name and substitutes it (the platform's
+    duplicate endpoint requires `name` in the body; v0.2.17 fix to honor
+    the docstring promise that pre-v0.2.17 silently broke with HTTP 422).
 
     Returns the new workflow's id + name.
     """
+    # v0.2.17: resolve the default name BEFORE calling the platform, since
+    # the platform requires `name` in the body and returns HTTP 422 if absent.
+    if not new_name:
+        source = api.get_workflow(workflow_id)
+        original_name = source.get("name") or "untitled"
+        new_name = f"Copy of {original_name}"
     resp = api.duplicate_workflow(workflow_id, new_name=new_name)
     return {
         "ok": True,

@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.16** ([release notes](#release-notes)).
+Current version: **v0.2.17** ([release notes](#release-notes)).
 
 ---
 
@@ -225,6 +225,23 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.17 — cleanup release (4 fixes + docstring corrections from v0.2.16 stress test)
+Live stress-testing v0.2.16 against 47 of 48 tools surfaced four real defects and two doc inaccuracies. All fixed.
+
+- **`duplicate_workflow` defaults `new_name` correctly.** Pre-v0.2.17: omitting the parameter sent empty body → HTTP 422. Now the wrapper reads the source workflow's name and substitutes `"Copy of <name>"` — matching what the docstring always promised. Caller-supplied names still win.
+- **`set_test_mode(on=False)` works.** Pre-v0.2.17: the wrapper PATCHed with only `{"isTestMode": false}` → HTTP 422 because the platform requires the full node envelope (id, typeId, variableName, settings_field_values, isTrigger). Now sends the full block with isTestMode flipped, matching `bulk_set_test_mode`'s correct approach.
+- **`partial_execute` orphan-trigger hint actually fires.** Pre-v0.2.17 the phrase matcher looked for `"Workflow must be executable"` / `"not in a valid state"` — but the platform actually returns `"Workflow has no Trigger nodes"` / `"Workflow has no start nodes"` / `"Workflow has no listener node"`. Hint was always absent for the most common failures. Added the three actual phrases.
+- **`create_workflow` docstring: one-off pattern fix.** Previously suggested attaching a Custom Code as the root with `pd.DataFrame(...)` for one-off workflows. **This validates clean (`isRunable=true`) but fails at runtime with `"No input data provided"`** — the platform expects root nodes to receive runtime input from a real source. New guidance: use a real data-source root (Sheets "Get Values in Range", file reader, etc.) OR use a Magic Node with a dummy upstream.
+- **`paste_nodes` docstring: required-fields list.** Investigation found the v0.2.16 stress test's HTTP 500 came from partially-malformed body shapes (the platform 500s on some malformed inputs and 422s on others). Wrapper itself is correct — beefed up the docstring with the canonical block shape and a "easiest way: `get_node` + mutate" pointer.
+- **Sheets-read node naming corrected throughout** — the action is "Get Values in Range" (typeId `ce01c704-…`), not "Read Output Tab".
+
+No new tools; surface count stays at 48. Tests: 195 → 210 (+15 in `test_v0_2_17_fixes.py`).
+
+**Non-bug findings deferred:**
+- `validate_custom_code` correctly emits E000 on actual syntax errors — the stress agent's test input `"this is not python"` is valid Python (a `this is_not python` comparison expression). Added regression tests with real syntax errors.
+- Error-contract inconsistency across run/monitor tools (only `partial_execute` returns structured `ok:false`; the other 5 raise) — flagged for v0.2.18.
+- `abort_execution` 404 — endpoint shape unknown until UI inspection lands. Docstring already warns.
 
 ### v0.2.16 — 6 edit tools converted to small-payload (big-workflow safe)
 Six tools that previously sent the full workflow on every edit (and 413'd past ~50 blocks) now use per-block PUTs:
