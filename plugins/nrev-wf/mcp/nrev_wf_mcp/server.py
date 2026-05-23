@@ -1051,6 +1051,15 @@ def attach_python_block(
     Code AS A ROOT (workflow start), use `attach_node(type_id=<CC typeId>,
     parent_node_ids=[], settings={...})` instead.
 
+    v0.2.20 Fix A: when the parent is a Pipedream-wrapped action (Slack send,
+    Sheets read, Gmail send, etc.), its outputs are the fixed triple
+    `[error, summary, payload]`. A downstream CC that doesn't explicitly
+    declare its own output_columns will have its schema silently overwritten
+    by the platform's Pipedream-shape inference, losing whatever new columns
+    your transform produces. This tool now refuses to attach with an empty
+    output_columns list when the parent is Pipedream-shaped — pass the
+    columns you actually want downstream blocks to see.
+
     Position defaults to 400 px right of parent.
     """
     issues = lint(code)
@@ -1075,6 +1084,26 @@ def attach_python_block(
         raise ValueError(
             f"parent_node_id {parent_node_id} not found in workflow {workflow_id}"
         )
+
+    # v0.2.20 Fix A: refuse empty output_columns when parent is Pipedream-shaped.
+    # The platform's schema inference for Pipedream parents propagates
+    # [error, summary, payload] as the child's columns_metadata — burying any
+    # new columns the CC produces from downstream introspection.
+    if not output_columns and _is_pipedream_block(parent):
+        parent_outs = (parent.get("outputs") or [{}])[0]
+        return {
+            "ok": False,
+            "stage": "pipedream_parent_schema_guard",
+            "parent_columns": parent_outs.get("columns") or [],
+            "message": (
+                f"Parent {parent_node_id!r} is a Pipedream-wrapped action; its "
+                f"outputs are the fixed [error, summary, payload] triple. "
+                f"You MUST pass explicit `output_columns` listing the columns "
+                f"this CC produces — otherwise downstream blocks will see only "
+                f"those three Pipedream columns. Tip: parse `payload` in your "
+                f"CC and emit the row fields you care about."
+            ),
+        }
 
     new_id = str(uuid.uuid4())
     columns_metadata = _build_columns_metadata(
@@ -1308,30 +1337,163 @@ def tail_execution(
 
         if wait_until == "status_terminal":
             if overall_status in ("completed", "failed", "stopped"):
-                return _slim_execution(raw, timed_out=False)
+                pr = _maybe_enrich_pipedream_errors(workflow_id, raw)
+                return _slim_execution(raw, timed_out=False, pipedream_row_errors=pr)
 
         elif wait_until == "block_completed":
             target_br = next((br for br in block_runs if br.get("workflowBlockId") == target_block_id), None)
             if target_br and target_br.get("status") in ("completed", "failed"):
-                return _slim_execution(raw, timed_out=False)
+                pr = _maybe_enrich_pipedream_errors(workflow_id, raw)
+                return _slim_execution(raw, timed_out=False, pipedream_row_errors=pr)
 
         elif wait_until == "any_change":
             current = {br.get("workflowBlockId"): br.get("status") for br in block_runs}
             if last_block_statuses and current != last_block_statuses:
-                return _slim_execution(raw, timed_out=False)
+                # Only enrich if any block reached terminal — otherwise no rows yet
+                any_terminal = any(br.get("status") in ("completed", "failed")
+                                   for br in block_runs)
+                pr = _maybe_enrich_pipedream_errors(workflow_id, raw) if any_terminal else {}
+                return _slim_execution(raw, timed_out=False, pipedream_row_errors=pr)
             last_block_statuses = current
 
         time.sleep(poll_seconds)
 
     # Timed out — return current state
     raw = api.get_execution_detail(workflow_id, execution_id)
-    return _slim_execution(raw, timed_out=True)
+    pr = _maybe_enrich_pipedream_errors(workflow_id, raw) if (raw.get("blockRuns") or []) else {}
+    return _slim_execution(raw, timed_out=True, pipedream_row_errors=pr)
 
 
-def _slim_execution(raw: dict, timed_out: bool) -> dict:
-    """Compact representation of an execution snapshot."""
+def _is_pipedream_block(block: dict) -> bool:
+    """True if the block is a Pipedream-wrapped action (Slack, Sheets, Gmail, Calendar, etc.).
+
+    Detection: a settings field whose name starts with "pipedream-" OR an
+    outputs column_metadata entry whose origin_node_type starts with "pipedream.".
+    Pipedream-wrapped actions have a quirk: block-level status reports
+    `completed / error:null` EVEN WHEN THE ACTION FAILED — the real error is
+    embedded in the row output's `error` column. See _check_pipedream_row_error.
+    """
+    if not isinstance(block, dict):
+        return False
+    sfv = block.get("settings_field_values") or []
+    for entry in sfv:
+        fn = entry.get("field_name") or ""
+        if fn.startswith("pipedream-"):
+            return True
+    outs = block.get("outputs") or []
+    for out in outs:
+        for col in (out.get("columns_metadata") or []):
+            ont = col.get("origin_node_type") or ""
+            if ont.startswith("pipedream."):
+                return True
+    return False
+
+
+def _check_pipedream_row_error(workflow_id: str, execution_id: str,
+                                block_id: str) -> Optional[dict]:
+    """Fetch the first output row of a Pipedream node and surface its error column.
+
+    v0.2.20: Pipedream-wrapped Add Single Row / Send Message / etc. return
+    block-level status:completed/error:null even when the underlying action
+    failed at the Pipedream layer. The real error is in row[0].error. This
+    helper reads that row and returns a structured dict:
+        {"has_row_error": bool, "row_error": <str | None>, "error_attribution": <dict | None>}
+    or None if the output couldn't be read.
+    """
+    try:
+        rows_resp = api.get_node_preview(workflow_id, execution_id, block_id,
+                                          handle_condition="_default",
+                                          skip=0, limit=1)
+    except Exception:
+        return None
+    # The API returns the rows under "entries" (full response shape) and the
+    # server tool surfaces them as "rows" — accept either.
+    rows = None
+    if isinstance(rows_resp, dict):
+        rows = rows_resp.get("entries") or rows_resp.get("rows") or []
+    if not rows:
+        return {"has_row_error": False, "row_error": None, "error_attribution": None}
+    row0 = rows[0] if isinstance(rows[0], dict) else {}
+    err_raw = row0.get("error")
+    err_1 = row0.get("error_1")
+    # The "error" column can be a JSON string envelope ([{ts, k, err: {name,message,...}}]);
+    # error_1 is the un-enveloped form. Prefer error_1 if present.
+    candidate = err_1 if err_1 else err_raw
+    if not candidate or candidate in (None, "", "[]", "null"):
+        return {"has_row_error": False, "row_error": None, "error_attribution": None}
+    # Try to parse error_1 JSON for a clean message + attribution
+    import json
+    parsed = None
+    if isinstance(candidate, str):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            parsed = None
+    if isinstance(parsed, dict):
+        msg = parsed.get("message") or parsed.get("name") or str(candidate)[:300]
+        attribution = parsed.get("attribution")
+        return {"has_row_error": True, "row_error": msg,
+                "error_attribution": attribution if isinstance(attribution, dict) else None}
+    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+        first = parsed[0]
+        inner = first.get("err") if isinstance(first.get("err"), dict) else first
+        msg = inner.get("message") or inner.get("name") or str(candidate)[:300]
+        return {"has_row_error": True, "row_error": msg, "error_attribution": None}
+    return {"has_row_error": True, "row_error": str(candidate)[:300],
+            "error_attribution": None}
+
+
+def _maybe_enrich_pipedream_errors(workflow_id: str, raw_execution: dict) -> dict:
+    """For each completed block run in the execution, if the block is Pipedream
+    and reported status:completed/error:null, fetch row[0] and surface row.error.
+
+    Returns a dict mapping block_id → {has_row_error, row_error, error_attribution}
+    ONLY for blocks where row error was detected. Empty dict if nothing to flag.
+    Best-effort: any per-block read failure is silently skipped.
+    """
+    execution_id = raw_execution.get("id")
+    if not execution_id:
+        return {}
+    block_runs = raw_execution.get("blockRuns") or []
+    if not block_runs:
+        return {}
+    # We need the workflow's block definitions to know which are Pipedream
+    try:
+        wf = api.get_workflow(workflow_id)
+        blocks_by_id = {b.get("id"): b for b in (wf.get("blocks") or [])}
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    for br in block_runs:
+        if br.get("status") != "completed":
+            continue
+        # Block-level error already present — don't bother with row-level check
+        if br.get("error"):
+            continue
+        block_id = br.get("workflowBlockId")
+        if not block_id:
+            continue
+        block = blocks_by_id.get(block_id)
+        if not block or not _is_pipedream_block(block):
+            continue
+        chk = _check_pipedream_row_error(workflow_id, execution_id, block_id)
+        if chk and chk.get("has_row_error"):
+            out[block_id] = chk
+    return out
+
+
+def _slim_execution(raw: dict, timed_out: bool,
+                    pipedream_row_errors: Optional[dict] = None) -> dict:
+    """Compact representation of an execution snapshot.
+
+    v0.2.20: if `pipedream_row_errors` is provided (dict block_id → row_error info),
+    block_runs entries for those blocks get an additional `pipedream_row_error`
+    field surfaced, AND the slim envelope adds a top-level `has_pipedream_row_errors`
+    flag so callers can branch on it without diving into per-block dicts.
+    """
     block_runs = raw.get("blockRuns") or []
-    return {
+    pr = pipedream_row_errors or {}
+    result = {
         "execution_id": raw.get("id"),
         "status": raw.get("status"),
         "creditsUsed": raw.get("creditsUsed") or raw.get("credits_used"),
@@ -1345,11 +1507,17 @@ def _slim_execution(raw: dict, timed_out: bool) -> dict:
                 "creditsUsed": br.get("creditsUsed"),
                 "duration": br.get("duration"),
                 "error": br.get("error"),
+                **({"pipedream_row_error": pr[br.get("workflowBlockId")]}
+                   if br.get("workflowBlockId") in pr else {}),
             }
             for br in block_runs
         ],
         "timed_out": timed_out,
     }
+    if pr:
+        result["has_pipedream_row_errors"] = True
+        result["pipedream_row_error_count"] = len(pr)
+    return result
 
 
 @mcp.tool()
@@ -2021,6 +2189,27 @@ def _walk_settings_set(settings_list: list[dict], segments: list[str], value) ->
     return False
 
 
+def _walk_settings_set_label(settings_list: list[dict], segments: list[str], label) -> bool:
+    """Walk a /-separated path and set the fieldLabel on the leaf entry.
+
+    v0.2.20: companion to _walk_settings_set, used when update_node_setting
+    is called with field_label= to bind a human-readable label alongside the
+    value (Pipedream connection fields and some dropdowns require this).
+    """
+    if not segments:
+        return False
+    head, rest = segments[0], segments[1:]
+    for entry in settings_list:
+        if entry.get("field_name") == head:
+            if not rest:
+                entry["fieldLabel"] = label
+                return True
+            if isinstance(entry.get("field_value"), list):
+                return _walk_settings_set_label(entry["field_value"], rest, label)
+            return False
+    return False
+
+
 def _list_field_paths(settings_list: list[dict], prefix: str = "") -> list[str]:
     """Enumerate all leaf field paths in nested settings_field_values."""
     paths = []
@@ -2106,8 +2295,10 @@ def update_node_setting(
     validate_after: bool = True,
     verify: bool = False,
     verify_cost_ack: bool = False,
+    add_if_missing: bool = True,
+    field_label: Optional[str] = None,
 ) -> dict:
-    """Replace a single setting value on a node, identified by its field path.
+    """Replace (or add) a single setting value on a node, identified by its field path.
 
     `field_path` is `/`-separated. Each segment matches a `field_name` in the
     settings tree. For top-level settings, just the field name. For nested
@@ -2115,8 +2306,24 @@ def update_node_setting(
 
         "data_manipulation-magic_node-code_section/data_manipulation-magic_node-code"
 
-    If the path isn't found, returns the list of all leaf paths so you can spot
-    the right one. Use `get_node` or `list_node_settings` first to inspect.
+    `add_if_missing=True` (default, v0.2.20): if the field_path is not present
+    in the node's current settings, append it as a new entry with the proper
+    envelope shape. This is REQUIRED for Pipedream nodes whose schema
+    progresses — they start with only the connection bound and additional
+    fields (drive, sheetId, hasHeaders, row data, etc.) must be ADDED as you
+    configure the node step-by-step. Only supports top-level paths (single
+    segment) for safety; for nested group additions, set the parent group
+    explicitly. Pass `add_if_missing=False` to restore strict modify-only
+    semantics.
+
+    `field_label`: optional human-readable label to bind alongside the value
+    (used by Pipedream connection fields and some dropdowns). Stored as
+    `fieldLabel` in the settings envelope.
+
+    If the path isn't found AND add_if_missing=False (or the path is nested
+    and the parent group doesn't exist), returns the list of all leaf paths so
+    you can spot the right one. Use `get_node`, `list_node_settings`, or
+    `get_node_dynamic_fields` first to inspect.
 
     `verify=True` (default False) runs `partial_execute` on this node after the
     update, reusing cached upstream from the most recent completed execution,
@@ -2132,18 +2339,36 @@ def update_node_setting(
 
     settings = target.get("settings_field_values") or []
     segments = field_path.split("/")
+    added = False
     if not _walk_settings_set(settings, segments, value):
-        return {
-            "ok": False,
-            "message": f"field_path {field_path!r} not found in node settings.",
-            "available_paths": _list_field_paths(settings),
-        }
+        # v0.2.20: optionally append as a new top-level entry
+        if add_if_missing and len(segments) == 1:
+            if target.get("settings_field_values") is None:
+                target["settings_field_values"] = []
+            target["settings_field_values"].append(_sf(segments[0], value, label=field_label))
+            added = True
+        else:
+            return {
+                "ok": False,
+                "message": (
+                    f"field_path {field_path!r} not found in node settings"
+                    + (" (nested paths cannot be auto-added; set the parent group first)"
+                       if len(segments) > 1 else "")
+                    + "."
+                ),
+                "available_paths": _list_field_paths(settings),
+            }
+    elif field_label is not None:
+        # Path found and field_label provided — update the label too
+        _walk_settings_set_label(target.get("settings_field_values") or [],
+                                 segments, field_label)
 
     # v0.2.16: per-node PUT instead of full-workflow PUT (avoids 413 on big workflows)
     mutation = _put_node_and_validate(workflow_id, node_id, target, validate_after)
     result = {
         "node_id": node_id,
         "field_path": field_path,
+        "added_new_field": added,  # v0.2.20: True if path was created, False if modified
         **mutation,
     }
 
@@ -2197,11 +2422,24 @@ def _verify_node_after_update(workflow_id: str, node_id: str, target_block: dict
                     "message": "node still running after 5 minutes"}
         # Read row count from the now-fresh output
         preview = api.get_node_preview(workflow_id, prior, node_id, limit=1)
-        return {
+        result = {
             "status": "completed",
             "prior_execution_id": prior,
             "total_entries": (preview or {}).get("meta", {}).get("total_entries"),
         }
+        # v0.2.20 Fix F: for Pipedream-wrapped nodes, block-level status:completed
+        # can mask a row-level error. Probe row[0].error so verify doesn't
+        # falsely claim success on a silently-failed Pipedream action.
+        if _is_pipedream_block(target_block):
+            chk = _check_pipedream_row_error(workflow_id, prior, node_id)
+            if chk and chk.get("has_row_error"):
+                result["pipedream_row_error"] = chk
+                result["status"] = "completed_with_pipedream_row_error"
+                result["message"] = (
+                    "The block completed but the Pipedream action returned an "
+                    "error in the row output. See pipedream_row_error for details."
+                )
+        return result
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -3284,16 +3522,97 @@ def _is_connection_id_field(field_name: str) -> bool:
     return last.endswith("connection_id") or last.endswith("connectionid")
 
 
-def _resolve_connection_label(target_value) -> Optional[str]:
-    """Look up a connection's friendly name from its connection_id."""
+def _extract_pipedream_app_slug(field_name: str) -> Optional[str]:
+    """For a Pipedream connection field like
+    `pipedream-google_sheets-google_sheets_add_single_row-googleSheets_connection_id`,
+    return the app slug (`google_sheets`). Used by Fix D to look up the
+    connection_app_id when the connection is owned by a teammate.
+    """
+    if not field_name or not field_name.startswith("pipedream-"):
+        return None
+    parts = field_name.split("-")
+    if len(parts) >= 2:
+        return parts[1]
+    return None
+
+
+@functools.lru_cache(maxsize=64)
+def _connection_app_id_for_slug(slug: str) -> Optional[str]:
+    """Look up the connection_app_id (UUID) for a Pipedream app slug
+    (e.g. `google_sheets`, `slack_v2`, `gmail`).
+
+    Cached for the server-process lifetime — the app catalog is static.
+    Paginates the catalog so we don't miss apps past offset 50.
+    """
+    if not slug:
+        return None
+    slug_low = slug.lower()
+    # Targeted search first (cheap) — match by app name approximation
+    search_term = slug.replace("_", " ")
+    try:
+        raw = api.list_connection_apps(limit=200, search=search_term) or {}
+    except Exception:
+        raw = {}
+    apps = raw.get("data") if isinstance(raw, dict) else (raw or [])
+    if not isinstance(apps, list):
+        apps = []
+    for a in apps:
+        name_slug = (a.get("name") or "").lower().replace(" ", "_")
+        if name_slug == slug_low or (a.get("slug") or "").lower() == slug_low:
+            return a.get("connectionAppId") or a.get("id")
+    # Fallback: full pagination
+    try:
+        for offset in range(0, 1000, 100):
+            raw = api.list_connection_apps(limit=100, offset=offset) or {}
+            apps = raw.get("data") if isinstance(raw, dict) else (raw or [])
+            if not isinstance(apps, list) or not apps:
+                break
+            for a in apps:
+                name_slug = (a.get("name") or "").lower().replace(" ", "_")
+                if name_slug == slug_low or (a.get("slug") or "").lower() == slug_low:
+                    return a.get("connectionAppId") or a.get("id")
+            if len(apps) < 100:
+                break
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_connection_label(target_value, field_name: Optional[str] = None) -> Optional[str]:
+    """Look up a connection's friendly name from its connection_id.
+
+    v0.2.20 Fix D: in multi-user tenants, the JWT user's own connection list
+    won't contain teammates' connections. If the first (unfiltered) lookup
+    misses AND `field_name` is a Pipedream connection field, derive the app
+    slug from the field name and call list_connections(connection_app_id=<id>)
+    to fetch ALL tenant connections for that app — that DOES include other
+    users' connections.
+    """
     if not target_value:
         return None
+    target_str = str(target_value)
     try:
-        conns = api.list_connections() or []
+        raw = api.list_connections() or []
+    except Exception:
+        raw = []
+    conns = raw if isinstance(raw, list) else (raw.get("data") if isinstance(raw, dict) else [])
+    for c in (conns or []):
+        if c.get("connectionId") == target_str:
+            return c.get("connectionName") or c.get("appName")
+
+    # v0.2.20 Fix D fallback: try the cross-tenant lookup
+    slug = _extract_pipedream_app_slug(field_name) if field_name else None
+    if not slug:
+        return None
+    app_id = _connection_app_id_for_slug(slug)
+    if not app_id:
+        return None
+    try:
+        raw2 = api.list_connections(connection_app_id=app_id) or []
     except Exception:
         return None
-    target_str = str(target_value)
-    for c in conns:
+    conns2 = raw2 if isinstance(raw2, list) else (raw2.get("data") if isinstance(raw2, dict) else [])
+    for c in (conns2 or []):
         if c.get("connectionId") == target_str:
             return c.get("connectionName") or c.get("appName")
     return None
@@ -3321,7 +3640,9 @@ def _resolve_field_label(
         return None
 
     if _is_connection_id_field(field_name):
-        return _resolve_connection_label(target_value)
+        # v0.2.20 Fix D: pass field_name so cross-tenant fallback can derive
+        # the Pipedream app slug and look up connections owned by teammates.
+        return _resolve_connection_label(target_value, field_name=field_name)
 
     try:
         resp = api.field_options(
@@ -3454,17 +3775,47 @@ def attach_node(
     Sheets, etc.) the platform fills in the schema from the catalog;
     leave `output_columns=None`.
 
-    PIPEDREAM CONNECTION-FIELD NAMING (catalog quirk surfaced in v0.2.18
-    stress test): the field name is `pipedream-<value_first_segment>-
-    <action>-<trailing_segment>` where the trailing segment matches the
-    catalog `value`'s first-after-`pipedream.` token, NOT the bare app
-    name. Examples:
-      - Gmail Send Email (value `pipedream.gmail.gmail_send_email`):
-          field name `pipedream-gmail-gmail_send_email-gmail`
-      - Slack V2 Send Message (value `pipedream.slack_v2.slack_v2_send_message`):
-          field name `pipedream-slack_v2-slack_v2_send_message-slack_v2`
-                                                              ^^^^^^^^
-          Note `slack_v2` repeated — NOT bare `slack`.
+    PIPEDREAM CONNECTION-FIELD NAMING IS INCONSISTENT AND NOT INFERABLE —
+    the trailing-segment heuristic below works for SOME actions but NOT all.
+    The ONLY reliable way to get the right field names is
+    `get_node_dynamic_fields(workflow_id, node_id)` — call it once after an
+    initial placeholder attach, read `dropdown_field_names`, and use those
+    exact strings in subsequent settings. Examples of the inconsistency:
+      - Gmail Send Email     → `pipedream-gmail-gmail_send_email-gmail`
+      - Slack V2 Send Message → `pipedream-slack_v2-slack_v2_send_message-slack_v2`
+      - Slack New Msg channel → `pipedream-slack_v2-slack_v2_new_message_in_channels-conversations`
+                                                                                      ^^^^^^^^^^^^^
+                                                       NOT `channel` or `channelId`
+      - Sheets Add Single Row connection
+                              → `pipedream-google_sheets-google_sheets_add_single_row-googleSheets_connection_id`
+                                                                                      ^^^^^^^^^^^^^^^^^^^^^^^^
+                              The trailing token can be ANY camelCase variant.
+    Bottom line: never guess Pipedream field names from a formula. Discover
+    them with `get_node_dynamic_fields`.
+
+    CANONICAL SHEETS CRUD PATTERNS (use these, not alternatives):
+      - **READ** rows: `Get Values in Range`
+        (`pipedream.google_sheets.google_sheets_get_values_in_range`).
+        Pass `range` in A1 notation (`Sheet1!A1:E100`). Use this for
+        anything that needs columns; the platform reads the header row
+        and emits one row per spreadsheet row.
+      - **WRITE one row at a time**: ALWAYS use `Add Single Row`
+        (`pipedream.google_sheets.google_sheets_add_single_row`) in a
+        per-row loop, NEVER `Add Multiple Rows`. Add Single Row has 5
+        schema fields (connection, drive, sheetId, worksheetId, hasHeaders);
+        the actual row values come from the UPSTREAM block's columns:
+          - hasHeaders=true  → upstream column names match sheet headers
+          - hasHeaders=false → upstream column order maps to sheet columns A,B,C,...
+        DO NOT try to set `myColumnData` or similar in `settings` — it
+        will be persisted silently and ignored by the Pipedream runtime.
+      - **UPDATE / DELETE rows**: similar pattern — use the single-row
+        action and pass row identity via upstream.
+
+    PIPEDREAM ROW-LEVEL ERROR DETECTION (v0.2.20): when a Pipedream node
+    "completes" with `error:null` at the block level, that does NOT mean
+    the action succeeded. The real error may be in row[0].error of the
+    output. `tail_execution` and `update_node_setting(verify=True)` auto-
+    surface this as `pipedream_row_error` — always check it.
 
     CROSS-TENANT CONNECTION RUNTIME ACCEPTANCE (v0.2.18 finding): in
     multi-user nRev tenants, the same connection_id may work at attach
@@ -3685,6 +4036,39 @@ def attach_node(
         existing_block_ids={b["id"] for b in wf["blocks"]},
     )
     err = _new_block_error_from_paste(resp, actual_new_id)
+
+    # v0.2.20 Fix C: for Pipedream-flavored typeIds, validate that the caller's
+    # field_names match the action's actual schema. Catches silent no-ops where
+    # a typo'd or invented field name gets stored uselessly (e.g. `myColumnData`
+    # on Add Single Row — the platform persists it but the Pipedream runtime
+    # ignores it because the action never asked for that field). Issues are
+    # warnings only — attach is still considered ok if the platform accepted
+    # the PUT.
+    pipedream_field_warnings: list[dict] = []
+    is_pipedream_type = any(fn.startswith("pipedream-") for fn in settings.keys())
+    if err is None and is_pipedream_type and actual_new_id:
+        try:
+            schema = api.updated_node_config(
+                node_id=actual_new_id,
+                node_definition_id=type_id,
+                field_name_changed=next(iter(settings.keys())),
+                setting_field_values=settings_field_values,
+                settings_schema=[],
+            )
+            valid_names = set()
+            for f in ((schema.get("nodeDefinition") or {}).get("fields") or []):
+                if isinstance(f, dict) and f.get("name"):
+                    valid_names.add(f["name"])
+            for given in settings.keys():
+                if valid_names and given not in valid_names:
+                    pipedream_field_warnings.append({
+                        "field_name": given,
+                        "issue": "not in action schema — value will be stored but ignored",
+                        "schema_field_names": sorted(valid_names),
+                    })
+        except Exception:
+            pass
+
     return {
         "ok": err is None,
         "node_id": actual_new_id,
@@ -3697,6 +4081,7 @@ def attach_node(
         "is_listener": resolved_is_listener,  # final value applied to the block
         "resolved_labels": resolved_labels,  # which dropdown fields got auto-resolved
         "explicit_labels": list(field_labels.keys()),  # which were caller-supplied
+        "pipedream_field_warnings": pipedream_field_warnings,  # v0.2.20
         "validation": _maybe_validate(workflow_id, validate_after),
     }
 

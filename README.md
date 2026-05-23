@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.19** ([release notes](#release-notes)).
+Current version: **v0.2.20** ([release notes](#release-notes)).
 
 ---
 
@@ -225,6 +225,20 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.20 — Pipedream silent-failure killers + Sheets CRUD documented
+**The Pipedream-quirk cleanup release.** Live end-to-end probing of v0.2.19 against Sheets revealed that Pipedream-wrapped action nodes (Add Single Row, Send Message, etc.) have a class of footguns the agent kept walking into: row-data fields that never appear in the static schema, block-level "completed/error:null" hiding row-level Pipedream errors, and update-then-write paths that couldn't add fields the schema reveals progressively. v0.2.20 ships six fixes:
+
+- **Fix F — `tail_execution` + `update_node_setting(verify=True)` auto-surface Pipedream row errors.** When a Pipedream node "completes" with `error: null` at the block level, that does NOT mean the action succeeded. The actual error frequently lives in row[0].error of the output — F2's "Sheets append succeeded" in v0.2.19 testing was actually a Pipedream "undefined is not an array" error that block-level reporting buried. The wrapper now detects Pipedream-shaped blocks and adds a `pipedream_row_error` field to the slim execution snapshot (with `has_pipedream_row_errors: True` at the top level). Status becomes `completed_with_pipedream_row_error` for verify runs.
+- **Fix B — `update_node_setting(add_if_missing=True, field_label=...)` can ADD new field paths.** Pre-v0.2.20 it could only modify EXISTING entries — but Pipedream nodes start with only the connection bound and need fields ADDED as the schema progresses (drive, sheetId, hasHeaders, etc.). The default is now `add_if_missing=True`. Response carries `added_new_field: bool` so callers know whether they modified or appended. Nested paths still require the parent group to exist (safer).
+- **Fix C — `attach_node` validates Pipedream field names against the action schema.** When the typeId is Pipedream-flavored, after attach the wrapper calls `updated-config-and-status` once and surfaces `pipedream_field_warnings: [{field_name, issue, schema_field_names}]` for any setting whose name isn't in the action's actual schema. Catches the F2-style silent no-op where a typo'd or invented field name (e.g. `myColumnData`) gets persisted by the platform but ignored by the Pipedream runtime.
+- **Fix A — `attach_python_block` refuses empty `output_columns` when parent is Pipedream-shaped.** A Pipedream parent's outputs are the fixed `[error, summary, payload]` triple. Without explicit output_columns on a CC downstream, the platform's schema inference buries any new columns the CC produces. New guard returns `stage: "pipedream_parent_schema_guard"` with the parent's columns listed for diagnosis.
+- **Fix D — cross-tenant `fieldLabel` resolution via `list_connections(connection_app_id=...)`.** Pre-v0.2.20, `attach_node`'s auto-label resolution called unfiltered `list_connections()` which only returns the JWT user's own — so binding a teammate's connection silently left `fieldLabel=null`. Now on miss the resolver extracts the app slug from the Pipedream field name, looks up the corresponding `connection_app_id`, and retries with the filter — picking up teammates' connections.
+- **Fix E + Sheets CRUD docstrings.** Made the Pipedream connection-field naming inconsistency loud in `attach_node` (with worked examples showing it's NOT a formula — discover via `get_node_dynamic_fields`). Documented canonical Sheets patterns: **READ = Get Values in Range, WRITE = Add Single Row in a per-row loop (NEVER Add Multiple Rows), row data comes from upstream (NEVER `myColumnData` in settings), check `pipedream_row_error` after every Pipedream execute**. User feedback: *"we never use add multiple rows"* and *"the MCP should know exactly which nodes it should use"*.
+
+Tool count unchanged at 49. Tests: 225 → 244 (+19 in `test_v0_2_20_fixes.py`).
+
+**Upgrade impact**: agents configuring Pipedream actions get loud, actionable warnings instead of silent no-ops. Cross-tenant attach now resolves labels correctly. Execution post-mortems include the real Pipedream errors that v0.2.19 was missing.
 
 ### v0.2.19 — Cross-tenant Pipedream node configuration UNBLOCKED
 **The big one for customer-tenant use cases.** Previously we couldn't fully configure Slack / Calendar / Sheets etc. when using a teammate's OAuth connection — cascading dropdowns (channels, calendars, worksheets) appeared to refuse cross-tenant context. v0.2.19 surfaces the platform's actual cross-tenant-friendly endpoint and makes everything work end-to-end.
