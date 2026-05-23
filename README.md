@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.13** ([release notes](#release-notes)).
+Current version: **v0.2.14** ([release notes](#release-notes)).
 
 ---
 
@@ -225,6 +225,22 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.14 — start-node vs trigger vocabulary fix (follow-up to v0.2.13)
+Live probing against the platform during v0.2.13 stress-tests surfaced that I'd conflated two distinct flags. The platform models them separately:
+
+- **Start node** = `isTrigger=true`. Marks a block as a swimlane entry point. Every workflow needs at least one (otherwise `"Workflow has no start nodes"`). MULTIPLE allowed — each begins its own swimlane.
+- **Trigger** (the user-facing automation entry) = `isTrigger=true` AND `isListener=true`. Polls/subscribes so the workflow runs on its own. ONLY ONE per workflow (platform-enforced).
+
+v0.2.13 auto-resolved both flags together from the catalog, which broke the one-off case: a plain Custom Code attached as root got both flags False, leaving the workflow with no start node. v0.2.14 separates the two:
+
+- Parents present → both False (unchanged from v0.2.13)
+- Parents empty (root block) → `isTrigger=True` ALWAYS (every root is a start node), `isListener` auto-detected from catalog (Scheduler/Sheets-read/Gmail listener types → True; Custom Code / plain transforms → False)
+- Explicit overrides always win. Pass `is_listener=False` on a Scheduler root for a one-off run of an otherwise-pollable type.
+
+Also rewrites `create_workflow` docstring with the correct vocabulary (start node vs trigger) and updates `attach_node`'s flag-defaults section to match. The agent now has the right mental model when building one-off vs scheduled vs event-driven workflows.
+
+Tests: 166 → 170 (+4 in `test_v0_2_14_root_defaults.py` pinning the four new behavioral branches).
 
 ### v0.2.13 — orphan-trigger hotfix + multi-input guard everywhere
 Bundle of six fixes addressing the regression pattern colleagues hit since v0.2.7. Plan was reviewed by an independent agent before shipping.

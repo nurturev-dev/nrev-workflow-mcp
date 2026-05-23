@@ -686,29 +686,51 @@ def create_workflow(name: str, description: str = "", validate_after: bool = Tru
     """Create a new empty workflow. Returns the new workflow including its
     assigned `id`. No blocks are added; the caller decides the shape.
 
-    Three common workflow patterns — pick the one that matches the user's intent:
+    KEY VOCABULARY (the platform models these as TWO distinct flags):
 
-      1. ONE-OFF / ad-hoc (most common when an agent builds a workflow on
-         request). The workflow stays in draft and is run on demand via
-         `partial_execute`. NO trigger node needed — start with whatever
-         upstream data-read node makes sense (Sheets read, file read, etc.)
-         using `attach_node(parent_node_ids=[], ...)` and chain downstream
-         blocks from there. The workflow's "Go Live" toggle stays off; that's
-         correct.
+      START NODE = `isTrigger=True`. Marks a block as a swimlane entry
+        point. EVERY workflow needs at least one start node (the platform
+        returns 'Workflow has no start nodes' otherwise). MULTIPLE start
+        nodes are allowed — each begins its own swimlane.
 
-      2. SCHEDULED / live (cron-like, runs on a schedule). Start with a
-         Scheduler block via `attach_node(parent_node_ids=[], type_id=<Scheduler typeId>, ...)`.
-         Scheduler is auto-detected as a trigger because it has no parents and
-         the catalog marks it trigger-capable; both isTrigger and isListener
-         are set automatically. Build the rest of the chain, then publish.
+      TRIGGER (the user-facing word for "automation") = `isTrigger=True`
+        AND `isListener=True`. The single block that polls / subscribes
+        to events so the workflow runs on its own (cron, webhook, new
+        message arrived). ONLY ONE per workflow (platform-enforced).
 
-      3. EVENT-DRIVEN / listener (webhook, Gmail new message, Slack message
-         arrived). Start with a listener-type trigger node, same pattern as
-         Scheduler. The platform polls or accepts events to fire it.
+    Most one-off workflows need start nodes but NOT a trigger.
 
-    Trigger-capable nodes attached WITH parents (Sheets "Read Output Tab" used
-    as a downstream read, etc.) are correctly NOT marked as triggers — the
-    v0.2.13 attach_node fix handles this.
+    Three common patterns — `attach_node` handles the flag defaults
+    correctly for each:
+
+      1. ONE-OFF / ad-hoc. Build a chain, run it manually with
+         `partial_execute`, throw it away (or keep it as a draft for
+         repeat manual runs). First node = start node, NOT a listener.
+         Example: `attach_node(parent_node_ids=[], type_id=<Custom Code>, ...)`
+         → wrapper auto-sets `isTrigger=True, isListener=False` because
+         Custom Code isn't listener-capable in the catalog. Workflow
+         stays in draft; no publish needed.
+
+      2. SCHEDULED / live. The workflow runs on its own cron. First node
+         = Scheduler. Example: `attach_node(parent_node_ids=[], type_id=<Scheduler>, ...)`
+         → wrapper auto-sets `isTrigger=True, isListener=True` because
+         Scheduler's catalog entry is listener-capable. Publish via
+         `publish_workflow` when ready (v0.2.14+).
+
+      3. EVENT-DRIVEN. Webhook, Gmail new message, Slack new message.
+         Same pattern as Scheduler — first node is a listener-type from
+         the catalog, both flags auto-set.
+
+    OVERRIDES: pass `is_trigger=False` explicitly if you genuinely want
+    a non-start-node root (uncommon; workflow will be invalid until
+    something IS a start node). Pass `is_listener=False` on a
+    listener-capable root if you want a one-off run of an otherwise-
+    pollable type (e.g. read a sheet once, don't keep polling).
+
+    Trigger-capable nodes attached WITH parents (Sheets "Read Output Tab"
+    used as a downstream read, etc.) are correctly NOT marked as start
+    nodes — the v0.2.13 `attach_node` fix forces both flags False when
+    parents exist, regardless of the catalog.
     """
     resp = api.create_workflow(name=name, description=description)
     new_id = resp.get("id")
@@ -3085,7 +3107,7 @@ def attach_node(
     settings as the platform expects (typically a field like
     `pipedream-<app>-<action>-connectionId`).
 
-    `parent_node_ids`: ZERO entries for trigger nodes (Scheduler etc.), or
+    `parent_node_ids`: ZERO entries for a workflow root (start node), or
     ONE entry for everything else. This tool refuses 2+ parents by default
     because almost every node type (Custom Code, HubSpot, Gmail, Sheets,
     Slack, AI, etc.) is single-input — multiple `_default` edges into a
@@ -3095,13 +3117,29 @@ def attach_node(
     multi-input non-Magic node is the legacy Merge block; pass
     `allow_multi_input=True` if you genuinely need that.
 
-    When `is_trigger` / `is_listener` are left as their defaults (None),
-    this tool looks up the node-definition catalog and sets both flags
-    automatically — so attaching a Scheduler with no parents produces a
-    real trigger that the workflow's "Go Live" toggle accepts, with no
-    extra ceremony required from the caller. Override either flag
-    explicitly (True/False) only when you know the catalog default is
-    wrong for your use case.
+    FLAG DEFAULTS (see `create_workflow` docstring for the full
+    start-node-vs-trigger vocabulary):
+
+      Parents PRESENT → block is downstream. Both `isTrigger` and
+        `isListener` default to False. Explicit overrides honored.
+        Pre-v0.2.13 this is where the orphan-trigger bug lived.
+
+      Parents EMPTY (root block) → `isTrigger` defaults to True (every
+        root is a start node — the platform requires at least one).
+        `isListener` is auto-detected from the node-def catalog:
+        Scheduler / Gmail New Message / Sheets Read (listener-capable
+        types) → True (live polling, becomes the workflow's automation
+        trigger); Custom Code / plain transforms → False (a start node
+        but not the automation entry point). Explicit overrides honored.
+
+      Common explicit overrides:
+        - `is_listener=False` on a Scheduler / Sheets-read root → one-off
+          run of an otherwise-pollable type (read once, don't keep polling)
+        - `is_trigger=False` on a root → unusual; produces a workflow
+          with no start node, invalid until something else is a start.
+
+      The platform allows MULTIPLE start nodes (each begins its own
+      swimlane) but ONLY ONE listener per workflow.
 
     `output_columns` is optional. Most app-backed nodes don't need explicit
     output schema (the platform fills it in from the node definition); supply
@@ -3173,32 +3211,43 @@ def attach_node(
     type_slug = _typeid_to_value_slug(type_id)
 
     # ── Resolve isTrigger / isListener ──────────────────────────────────────
-    # Two cases:
-    #   1. No parents → this block is being added as a workflow root. Consult
-    #      the node-definition catalog: Scheduler (and other trigger-capable
-    #      types) need BOTH isTrigger=true AND isListener=true on the block
-    #      for the workflow's "Go Live" toggle to work; setting only one
-    #      silently leaves the workflow in draft and shows the misleading
-    #      "Add a Trigger Node" tooltip.
-    #   2. Parents exist → this block is downstream. It cannot be a trigger
-    #      regardless of what the catalog says, because the catalog's
-    #      is_trigger=true flag means "CAN be used as a trigger" not "MUST be
-    #      a trigger." E.g. Google Sheets "Read Output Tab" is trigger-capable
-    #      (it can poll for new rows) but is also a perfectly normal read step
-    #      when given an upstream parent. Force both flags False so a
-    #      trigger-capable type doesn't accidentally become an orphan trigger
-    #      sibling to the workflow's real trigger. This was the v0.2.7
-    #      regression (fixed in v0.2.13).
-    auto_trigger: Optional[bool] = None
+    # Two distinct concepts the platform models with two flags:
+    #
+    #   isTrigger = "this block is a START NODE" — a swimlane entry point.
+    #   Every workflow needs AT LEAST ONE start node ("no start nodes"
+    #   error otherwise). Multiple are allowed (each starts its own
+    #   swimlane).
+    #
+    #   isListener = "this block is the workflow's automation trigger" —
+    #   it polls / subscribes to events so the workflow runs on its own.
+    #   ONLY ONE listener per workflow (platform enforces).
+    #
+    # Default resolution:
+    #   Parents present → block is downstream → both flags False (unless
+    #     caller explicitly overrides). Pre-v0.2.13 this was the bug:
+    #     trigger-capable types got auto-flagged as triggers even
+    #     downstream, producing orphan triggers.
+    #   No parents → block is a root → isTrigger=True ALWAYS (every root
+    #     is a start node by platform rule). isListener auto-detected from
+    #     the node-def catalog: Scheduler / Gmail New Message / Sheets
+    #     Read (listener-capable types) → True; Custom Code / plain
+    #     transforms → False. This preserves the v0.2.7 ergonomics
+    #     (Scheduler "just works" without remembering is_listener=True)
+    #     while also correctly marking plain Custom Code roots as start
+    #     nodes so one-off workflows are valid.
+    #
+    # Explicit overrides always win. Pass is_listener=False on a
+    # Scheduler/listener-capable root if you want a one-off run of an
+    # otherwise-pollable type.
     auto_listener: Optional[bool] = None
-    if not parent_node_ids and (is_trigger is None or is_listener is None):
-        auto_trigger, auto_listener = _lookup_node_def_flags(type_id)
+    if not parent_node_ids and is_listener is None:
+        _, auto_listener = _lookup_node_def_flags(type_id)
     if parent_node_ids:
-        # Downstream block — explicit caller override wins, otherwise False.
         resolved_is_trigger = is_trigger if is_trigger is not None else False
         resolved_is_listener = is_listener if is_listener is not None else False
     else:
-        resolved_is_trigger = is_trigger if is_trigger is not None else (auto_trigger or False)
+        # Root block: always a start node, listener auto from catalog.
+        resolved_is_trigger = is_trigger if is_trigger is not None else True
         resolved_is_listener = is_listener if is_listener is not None else (auto_listener or False)
 
     # Position: 400 px right of rightmost parent (or origin for triggers)
