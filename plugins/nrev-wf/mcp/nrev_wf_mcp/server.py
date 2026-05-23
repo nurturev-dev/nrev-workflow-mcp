@@ -683,14 +683,32 @@ def _new_block_error_from_paste(paste_resp: dict, new_id: str) -> Optional[str]:
 
 @mcp.tool()
 def create_workflow(name: str, description: str = "", validate_after: bool = True) -> dict:
-    """Create a new empty workflow.
+    """Create a new empty workflow. Returns the new workflow including its
+    assigned `id`. No blocks are added; the caller decides the shape.
 
-    Returns the new workflow including its assigned `id`. The workflow has no
-    blocks yet — add a Scheduler trigger and downstream nodes via attach_*
-    tools, or paste a starter via the web UI.
+    Three common workflow patterns — pick the one that matches the user's intent:
 
-    This is the safe sandbox-creation tool: spin up a throwaway workflow when
-    you want to experiment without touching anything live.
+      1. ONE-OFF / ad-hoc (most common when an agent builds a workflow on
+         request). The workflow stays in draft and is run on demand via
+         `partial_execute`. NO trigger node needed — start with whatever
+         upstream data-read node makes sense (Sheets read, file read, etc.)
+         using `attach_node(parent_node_ids=[], ...)` and chain downstream
+         blocks from there. The workflow's "Go Live" toggle stays off; that's
+         correct.
+
+      2. SCHEDULED / live (cron-like, runs on a schedule). Start with a
+         Scheduler block via `attach_node(parent_node_ids=[], type_id=<Scheduler typeId>, ...)`.
+         Scheduler is auto-detected as a trigger because it has no parents and
+         the catalog marks it trigger-capable; both isTrigger and isListener
+         are set automatically. Build the rest of the chain, then publish.
+
+      3. EVENT-DRIVEN / listener (webhook, Gmail new message, Slack message
+         arrived). Start with a listener-type trigger node, same pattern as
+         Scheduler. The platform polls or accepts events to fire it.
+
+    Trigger-capable nodes attached WITH parents (Sheets "Read Output Tab" used
+    as a downstream read, etc.) are correctly NOT marked as triggers — the
+    v0.2.13 attach_node fix handles this.
     """
     resp = api.create_workflow(name=name, description=description)
     new_id = resp.get("id")
@@ -1102,19 +1120,76 @@ def partial_execute(
                 }
         except Exception as e:
             refresh_results.append({"node_id": refresh_node_id, "status": "error", "error": str(e)})
-            return {
-                "ok": False,
-                "stage": "refresh_chain",
-                "stuck_at_node": refresh_node_id,
-                "refresh_results": refresh_results,
-                "message": str(e),
-            }
+            return _execute_error_response(
+                stage="refresh_chain",
+                stuck_at_node=refresh_node_id,
+                refresh_results=refresh_results,
+                exc=e,
+            )
 
-    resp = api.execute_node(workflow_id, target_node_id, prior_execution_id)
+    # ── Final target-node execute ───────────────────────────────────────────
+    # v0.2.13: catch the platform's non-2xx errors so we surface a structured
+    # ok=False instead of bubbling a raw exception that the caller has to
+    # interpret. Also augment well-known errors with a diagnostic hint
+    # (orphan triggers are the most common cause of "Workflow must be
+    # executable" / "not in a valid state").
+    try:
+        resp = api.execute_node(workflow_id, target_node_id, prior_execution_id)
+    except Exception as e:
+        return _execute_error_response(
+            stage="target_execute",
+            stuck_at_node=target_node_id,
+            refresh_results=refresh_results,
+            exc=e,
+        )
     result = {"ok": True, "response": resp}
     if refresh_results:
         result["refresh_results"] = refresh_results
     return result
+
+
+# Substrings the platform commonly returns when execution is gated.
+# Treated as advisory pattern matching — the load-bearing signal is the
+# non-2xx HTTP status from api.execute_node. If a future platform release
+# changes the wording, the hint is just absent; ok=False is still returned.
+_EXECUTE_GATE_PHRASES = (
+    "workflow must be executable",
+    "not in a valid state to execute",
+    "must be in a valid state",
+)
+
+
+def _execute_error_response(
+    *,
+    stage: str,
+    stuck_at_node: str,
+    refresh_results: list[dict],
+    exc: Exception,
+) -> dict:
+    """Build a structured failure response for partial_execute. Surfaces the
+    platform's raw error and — when it matches a known execution-gate
+    phrase — adds a hint pointing the caller at the most common cause."""
+    msg = str(exc)
+    body = {
+        "ok": False,
+        "stage": stage,
+        "stuck_at_node": stuck_at_node,
+        "message": msg,
+    }
+    if refresh_results:
+        body["refresh_results"] = refresh_results
+    low = msg.lower()
+    if any(p in low for p in _EXECUTE_GATE_PHRASES):
+        body["hint"] = (
+            "The platform refused to execute. The most common cause is "
+            "orphan trigger nodes (multiple blocks with isTrigger=True). "
+            "Run validate_workflow + get_workflow_graph to inspect. If a "
+            "trigger-capable node (Sheets read, Gmail poll, etc.) was "
+            "attached as a downstream block, it may have been auto-flagged "
+            "as a trigger by attach_node pre-v0.2.13. Patch the offender "
+            "via update_node_setting or rebuild it correctly."
+        )
+    return body
 
 
 @mcp.tool()
@@ -1407,6 +1482,33 @@ def _describe_test_mode_scope(node_ids: Optional[list[str]], downstream_of: Opti
 # Wiring (add/remove edges, delete blocks, splice branches)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+# Handle names used by Magic Node for fan-in (df1, df2, ..., df5). Exempt
+# from the single-input guard because Magic Node is THE supported way to wire
+# multiple upstreams into one block. This is an MCP-wrapper convention — the
+# platform's OpenAPI spec doesn't enumerate handle names, so we hardcode it
+# here. If a future platform release adds another fan-in node type, this set
+# needs to grow.
+_MAGIC_NODE_FAN_IN_HANDLES = {"df1", "df2", "df3", "df4", "df5"}
+
+
+def _find_existing_default_incoming(blocks: list[dict], target_node_id: str) -> Optional[dict]:
+    """Search every block's toBlocks for a `_default → _default` edge pointing
+    at `target_node_id`. Returns the first such edge dict (with `source_id`
+    added for diagnostics) or None.
+
+    Used by the single-input guard in add_edge / splice_branch: if such an
+    edge already exists, adding another `_default` edge into the same target
+    silently breaks runtime (downstream block only knows how to read one input).
+    """
+    for src_block in blocks:
+        for e in (src_block.get("toBlocks") or []):
+            if (e.get("toBlockId") == target_node_id
+                    and e.get("edge_target_handle_condition") == "_default"):
+                return {**e, "source_id": src_block.get("id")}
+    return None
+
+
 @mcp.tool()
 def add_edge(
     workflow_id: str,
@@ -1414,12 +1516,24 @@ def add_edge(
     target_node_id: str,
     source_handle: str = "_default",
     target_handle: str = "_default",
+    allow_multi_input: bool = False,
     validate_after: bool = True,
 ) -> dict:
     """Add an edge from source_node → target_node.
 
     Idempotent: if an identical edge already exists (same source, target, both
     handles), this is a no-op.
+
+    SINGLE-INPUT GUARD (v0.2.13): if `target_handle == "_default"` and the
+    target already has a `_default` incoming edge from a different source,
+    this tool refuses with a ValueError. Wiring two `_default` edges into
+    a single-input node (HubSpot, Gmail, Sheets, Custom Code, AI — almost
+    everything) looks fine in the UI but silently breaks at execution
+    because the downstream block only knows how to read one input. Use
+    `attach_magic_node` (1–5 inputs with df1..dfN handles) for joins, or
+    `remove_edge` to drop the existing edge first. The guard is skipped
+    when `target_handle ∈ {df1..df5}` (Magic Node fan-in). For the legacy
+    Merge block specifically, pass `allow_multi_input=True`.
 
     For Magic Node fan-in, set `target_handle` to `df1` … `df5` to pick the
     dataframe slot. NOTE: adding an edge to a Magic Node also requires updating
@@ -1435,6 +1549,27 @@ def add_edge(
         raise ValueError(f"source_node_id {source_node_id} not in workflow {workflow_id}")
     if target_node_id not in blocks_by_id:
         raise ValueError(f"target_node_id {target_node_id} not in workflow {workflow_id}")
+
+    # ── Single-input guard ──────────────────────────────────────────────────
+    # Only applies when target_handle is _default (the everything-else path).
+    # Magic Node uses dfN handles and is exempt by design.
+    if (target_handle == "_default"
+            and target_handle not in _MAGIC_NODE_FAN_IN_HANDLES
+            and not allow_multi_input):
+        existing = _find_existing_default_incoming(wf["blocks"], target_node_id)
+        # An identical edge (same source) is fine — that's the idempotent path
+        # below. Only refuse when the existing edge is from a DIFFERENT source.
+        if existing and existing.get("source_id") != source_node_id:
+            raise ValueError(
+                f"add_edge refuses to wire a second `_default` edge into "
+                f"{target_node_id}. It already has an incoming `_default` edge "
+                f"from {existing.get('source_id')}. Multiple `_default` edges "
+                f"into one block looks fine in the UI but silently breaks at "
+                f"execution. For joining or merging multiple data streams use "
+                f"attach_magic_node (1–5 inputs, df1..dfN handles). To replace "
+                f"the existing edge, call remove_edge first. For the legacy "
+                f"Merge block specifically, pass allow_multi_input=True."
+            )
 
     src = blocks_by_id[source_node_id]
     edges = src.get("toBlocks") or []
@@ -1571,6 +1706,7 @@ def splice_branch(
     downstream_target_handle: str = "_default",
     replace_edge_from_node_id: Optional[str] = None,
     replace_edge_target_handle: str = "_default",
+    allow_multi_input: bool = False,
     validate_after: bool = True,
 ) -> dict:
     """Splice a new branch into the live path. Atomic add + optional replace.
@@ -1579,6 +1715,13 @@ def splice_branch(
     §11.8). Adds an edge from `new_terminal_node_id` to `downstream_target_node_id`,
     optionally removing the equivalent edge from `replace_edge_from_node_id` to
     the same downstream — all in a single PUT for atomicity.
+
+    SINGLE-INPUT GUARD (v0.2.13): if `replace_edge_from_node_id` is None AND
+    `downstream_target_handle == "_default"`, the same guard as add_edge fires:
+    we refuse to wire a second `_default` edge into a single-input target.
+    The typical splice pattern (with `replace_edge_from_node_id` set) is
+    unaffected because the old edge is removed before the new one is added.
+    Pass `allow_multi_input=True` for the legacy Merge case.
 
     After this, you can safely `delete_node(replace_edge_from_node_id)` and any
     upstream blocks that were exclusive to the old chain.
@@ -1605,6 +1748,26 @@ def splice_branch(
             else:
                 kept.append(e)
         old_src["toBlocks"] = kept
+
+    # ── Single-input guard (same as add_edge) ───────────────────────────────
+    # Only when there's no replace target — otherwise the splice pattern is
+    # already removing one edge before adding the new one, so net incoming
+    # count stays at 1.
+    if (replace_edge_from_node_id is None
+            and downstream_target_handle == "_default"
+            and downstream_target_handle not in _MAGIC_NODE_FAN_IN_HANDLES
+            and not allow_multi_input):
+        existing = _find_existing_default_incoming(wf["blocks"], downstream_target_node_id)
+        if existing and existing.get("source_id") != new_terminal_node_id:
+            raise ValueError(
+                f"splice_branch refuses to wire a second `_default` edge into "
+                f"{downstream_target_node_id}. It already has an incoming "
+                f"`_default` edge from {existing.get('source_id')}. To replace "
+                f"that edge, pass replace_edge_from_node_id="
+                f"{existing.get('source_id')!r}. For Magic Node fan-in use a "
+                f"dfN target handle. For the legacy Merge block specifically, "
+                f"pass allow_multi_input=True."
+            )
 
     new_terminal = blocks_by_id[new_terminal_node_id]
     new_edges = new_terminal.get("toBlocks") or []
@@ -2424,6 +2587,16 @@ def clone_node(
     # Clear outgoing edges — clone is terminal until caller wires it
     cloned["toBlocks"] = []
 
+    # ── Strip trigger flags (v0.2.13) ───────────────────────────────────────
+    # A clone is structurally never a trigger — the workflow already has its
+    # trigger (the source we just copied from). Deepcopy carries isTrigger
+    # and isListener through, so a naive clone of a Scheduler creates a
+    # second trigger and silently corrupts the workflow. Always strip both,
+    # and surface a note if the source had them set so the caller knows.
+    cloned_trigger_stripped = bool(source.get("isTrigger") or source.get("isListener"))
+    cloned["isTrigger"] = False
+    cloned["isListener"] = False
+
     # Self-reference fix: outputs[].node_id pointed at the source; update to new_id
     for out in cloned.get("outputs") or []:
         if out.get("node_id") == source_node_id:
@@ -2449,7 +2622,7 @@ def clone_node(
         None,
     )
 
-    return {
+    out_response = {
         "ok": err is None and not resp.get("workflowConfigError"),
         "new_node_id": new_id,
         "source_node_id": source_node_id,
@@ -2462,6 +2635,14 @@ def clone_node(
         "workflowConfigError": resp.get("workflowConfigError"),
         "validation": _maybe_validate(workflow_id, validate_after),
     }
+    if cloned_trigger_stripped:
+        out_response["trigger_stripped"] = (
+            "Source node was a trigger (isTrigger or isListener was True). "
+            "The clone was created with both flags set to False — a clone "
+            "is structurally never the workflow's trigger. If you intended "
+            "a second trigger, use attach_node with is_trigger=True instead."
+        )
+    return out_response
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2992,17 +3173,33 @@ def attach_node(
     type_slug = _typeid_to_value_slug(type_id)
 
     # ── Resolve isTrigger / isListener ──────────────────────────────────────
-    # If the caller left either flag as None, consult the node-definition
-    # catalog. The Scheduler (and any other trigger-capable type) needs BOTH
-    # isTrigger=true AND isListener=true on the block for the workflow's
-    # "Go Live" toggle to work; setting only one silently leaves the workflow
-    # in draft and shows the misleading "Add a Trigger Node" tooltip.
+    # Two cases:
+    #   1. No parents → this block is being added as a workflow root. Consult
+    #      the node-definition catalog: Scheduler (and other trigger-capable
+    #      types) need BOTH isTrigger=true AND isListener=true on the block
+    #      for the workflow's "Go Live" toggle to work; setting only one
+    #      silently leaves the workflow in draft and shows the misleading
+    #      "Add a Trigger Node" tooltip.
+    #   2. Parents exist → this block is downstream. It cannot be a trigger
+    #      regardless of what the catalog says, because the catalog's
+    #      is_trigger=true flag means "CAN be used as a trigger" not "MUST be
+    #      a trigger." E.g. Google Sheets "Read Output Tab" is trigger-capable
+    #      (it can poll for new rows) but is also a perfectly normal read step
+    #      when given an upstream parent. Force both flags False so a
+    #      trigger-capable type doesn't accidentally become an orphan trigger
+    #      sibling to the workflow's real trigger. This was the v0.2.7
+    #      regression (fixed in v0.2.13).
     auto_trigger: Optional[bool] = None
     auto_listener: Optional[bool] = None
-    if is_trigger is None or is_listener is None:
+    if not parent_node_ids and (is_trigger is None or is_listener is None):
         auto_trigger, auto_listener = _lookup_node_def_flags(type_id)
-    resolved_is_trigger = is_trigger if is_trigger is not None else (auto_trigger or False)
-    resolved_is_listener = is_listener if is_listener is not None else (auto_listener or False)
+    if parent_node_ids:
+        # Downstream block — explicit caller override wins, otherwise False.
+        resolved_is_trigger = is_trigger if is_trigger is not None else False
+        resolved_is_listener = is_listener if is_listener is not None else False
+    else:
+        resolved_is_trigger = is_trigger if is_trigger is not None else (auto_trigger or False)
+        resolved_is_listener = is_listener if is_listener is not None else (auto_listener or False)
 
     # Position: 400 px right of rightmost parent (or origin for triggers)
     if parent_node_ids:

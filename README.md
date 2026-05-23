@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.12** ([release notes](#release-notes)).
+Current version: **v0.2.13** ([release notes](#release-notes)).
 
 ---
 
@@ -225,6 +225,18 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.13 — orphan-trigger hotfix + multi-input guard everywhere
+Bundle of six fixes addressing the regression pattern colleagues hit since v0.2.7. Plan was reviewed by an independent agent before shipping.
+
+- **`attach_node` auto-trigger now respects parents.** Pre-fix: any trigger-capable type (Sheets Read Output Tab, Gmail New Email, etc.) attached as a downstream node got silently marked `isTrigger=True, isListener=True` because the catalog says it CAN be a trigger. Result: orphan trigger nodes and platform refusing to execute. Now: trigger flags only auto-resolve when `parent_node_ids=[]` (workflow root). With parents, both flags are forced False unless the caller explicitly overrides.
+- **`add_edge` single-input guard.** Refuses to wire a second `_default` edge into a target that already has one. Exempts `df1..df5` (Magic Node fan-in). Opt-in `allow_multi_input=True` for the legacy Merge block. Closes the leak that bypassed v0.2.11's `attach_node` guard.
+- **`splice_branch` reuses the same guard** when `replace_edge_from_node_id=None`. The typical splice pattern (with replace target) is unaffected — net incoming count stays at 1.
+- **`clone_node` strips `isTrigger`/`isListener`** on the clone, regardless of source. A clone is structurally never the workflow's trigger; cloning a Scheduler used to silently produce a second trigger.
+- **`create_workflow` docstring rewrite.** Three explicit patterns (one-off / scheduled / event-driven) instead of the previous "add a Scheduler trigger" bias — one-off workflows are now a first-class case the agent can recognise.
+- **`partial_execute` surfaces non-2xx platform errors.** Pre-fix: silently raised. Now returns `ok=False` with the platform's exact message, plus an orphan-trigger hint when the error matches known execution-gate phrases. The agent gets a structured failure instead of a raw exception to misinterpret.
+
+Tests: 151 → 166 (+15 in `test_v0_2_13_fixes.py` covering all five behavioural changes plus regression guards).
 
 ### v0.2.12 — credit balance + sticky notes
 - New `get_credit_balance` tool — surfaces the active tenant's nRev credit balance as a plain integer. Tenant is resolved server-side from the JWT, so no parameter needed; useful as a sanity check before kicking off credit-heavy runs or when juggling multiple tenants (one Claude Code session per tenant, see [Multi-tenant pattern](#multi-tenant-pattern)).
