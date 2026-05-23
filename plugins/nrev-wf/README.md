@@ -2,7 +2,7 @@
 
 48 tools for building, debugging, and operating nRev workflows from inside Claude. Internal NurtureV tool — auth is per-user JWT (paste once per Claude session, never stored).
 
-Current version: **v0.2.15** — see release notes in the [repo README](https://github.com/nurturev-dev/nrev-workflow-mcp#release-notes).
+Current version: **v0.2.16** — see release notes in the [repo README](https://github.com/nurturev-dev/nrev-workflow-mcp#release-notes).
 
 ## Install
 

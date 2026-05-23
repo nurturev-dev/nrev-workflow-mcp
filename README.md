@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.15** ([release notes](#release-notes)).
+Current version: **v0.2.16** ([release notes](#release-notes)).
 
 ---
 
@@ -225,6 +225,30 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.16 — 6 edit tools converted to small-payload (big-workflow safe)
+Six tools that previously sent the full workflow on every edit (and 413'd past ~50 blocks) now use per-block PUTs:
+
+- `update_node_setting` — patch a single field
+- `update_magic_node` — update code / instructions / output schema
+- `update_ai_prompt` — change a prompt string
+- `set_node_output_schema` — declare output columns
+- `add_edge` — wire one source → one target
+- `remove_edge` — drop one edge
+
+All six use a new shared helper `_put_node_and_validate` that wraps `PUT /workflows/{id}/nodes/{node_id}` with the same {ok, node_config_error, workflowConfigError, isRunable, validation} response shape they had before. Backward-compatible — no caller changes required.
+
+**Independent review** before shipping caught two issues:
+1. Scope was off by one — original plan said 11 tools; the audit found `set_test_mode` already used per-node PUT. v0.2.16 ships 6 LOW-risk tools.
+2. `delete_node` is structurally blocked — OpenAPI confirms there's **no DELETE node endpoint**. Until the platform team adds one, `delete_node` will continue to 413 on big workflows. Issue queued for platform escalation; no v0.2.x fix possible from the wrapper.
+
+**Still on full-PUT (planned for v0.2.17+):**
+- `splice_branch` — atomicity concession needed (current full-PUT is atomic; per-node version has a brief two-edge window). Will need add-then-remove ordering.
+- `clone_node` — id-reassignment via paste-nodes is doable but needs careful integration with the existing helper.
+- `bulk_set_test_mode` — deferred. N sequential put_node calls is materially slower than 1 big PUT when the workflow fits under 1 MB. Will branch on block count.
+- `delete_node` — blocked on platform endpoint.
+
+Tests: 184 → 195 (+11 in `test_v0_2_16_conversions.py`). Includes a regression guard that pins the count of remaining `_put_workflow_blocks` callers, so future early conversions trip a test.
 
 ### v0.2.15 — workflow lifecycle + slim-view audit fields + paste_nodes hardening
 Four small wins shipped together. No behavioral changes to existing tools (except `paste_nodes` which gains a guard); all additive.

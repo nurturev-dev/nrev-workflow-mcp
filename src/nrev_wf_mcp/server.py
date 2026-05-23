@@ -1626,14 +1626,14 @@ def add_edge(
     })
     src["toBlocks"] = edges
 
-    resp = _put_workflow_blocks(workflow_id, wf)
+    # v0.2.16: per-node PUT instead of full-workflow PUT (avoids 413 on big workflows).
+    # The only mutation is the source's toBlocks; everything else in `wf` is
+    # untouched. Send just the updated source block to put_node.
+    mutation = _put_node_and_validate(workflow_id, source_node_id, src, validate_after)
     return {
-        "ok": not resp.get("workflowConfigError"),
         "edge_existed": False,
         "edge_added": True,
-        "workflowConfigError": resp.get("workflowConfigError"),
-        "isRunable": resp.get("isRunable"),
-        "validation": _maybe_validate(workflow_id, validate_after),
+        **mutation,
     }
 
 
@@ -1679,13 +1679,13 @@ def remove_edge(
         return {"ok": True, "removed_count": 0, "message": "no matching edge — no-op",
                 "validation": _maybe_validate(workflow_id, validate_after)}
 
-    resp = _put_workflow_blocks(workflow_id, wf)
+    # v0.2.16: per-node PUT instead of full-workflow PUT (avoids 413 on big workflows).
+    # The only mutation is the source's toBlocks; everything else in `wf` is
+    # untouched. Send just the updated source block to put_node.
+    mutation = _put_node_and_validate(workflow_id, source_node_id, src, validate_after)
     return {
-        "ok": not resp.get("workflowConfigError"),
         "removed_count": removed,
-        "workflowConfigError": resp.get("workflowConfigError"),
-        "isRunable": resp.get("isRunable"),
-        "validation": _maybe_validate(workflow_id, validate_after),
+        **mutation,
     }
 
 
@@ -1835,7 +1835,16 @@ def splice_branch(
 
 
 def _put_workflow_blocks(workflow_id: str, wf: dict) -> dict:
-    """Internal helper: PUT the workflow with current blocks (used after wiring edits)."""
+    """Internal helper: PUT the workflow with current blocks (used after wiring edits).
+
+    LEGACY (pre-v0.2.16): this is the full-workflow PUT that 413s on workflows
+    past ~50 blocks. v0.2.16 converted the 6 single-block mutation tools
+    (update_node_setting, update_magic_node, update_ai_prompt,
+    set_node_output_schema, add_edge, remove_edge) to use the smaller
+    `_put_node_and_validate` helper instead. The remaining callers
+    (delete_node, splice_branch, clone_node, set_test_mode workflow-scope,
+    bulk_set_test_mode) still use this path — see v0.2.17+ for those.
+    """
     payload = {"workflow_details": {
         "id": workflow_id,
         "name": wf.get("name"),
@@ -1843,6 +1852,39 @@ def _put_workflow_blocks(workflow_id: str, wf: dict) -> dict:
         "blocks": wf["blocks"],
     }}
     return api.put_workflow(workflow_id, payload)
+
+
+def _put_node_and_validate(
+    workflow_id: str,
+    node_id: str,
+    node: dict,
+    validate_after: bool,
+) -> dict:
+    """v0.2.16 helper for single-block mutation tools.
+
+    Replaces the pre-v0.2.16 full-workflow PUT (which 413s past ~50 blocks)
+    with the platform's per-node PUT. Returns a standard response slice
+    `{ok, node_config_error, workflowConfigError, isRunable, validation}`
+    that the converted tools merge into their richer return dicts.
+
+    The per-node PUT response carries `node_config_error` for the updated
+    block. Workflow-level fields (`workflowConfigError`, `isRunable`) come
+    from the optional post-mutation validate GET — set `validate_after=False`
+    to skip that GET, in which case workflow-level fields are surfaced as
+    None and the caller is responsible for any follow-up validation.
+    """
+    put_resp = api.put_node(workflow_id, node_id, node)
+    node_err = put_resp.get("node_config_error") if isinstance(put_resp, dict) else None
+    validation = _maybe_validate(workflow_id, validate_after)
+    workflow_err = validation.get("workflowConfigError") if validation else None
+    is_runable = validation.get("isRunable") if validation else None
+    return {
+        "ok": node_err is None and not workflow_err,
+        "node_config_error": node_err,
+        "workflowConfigError": workflow_err,
+        "isRunable": is_runable,
+        "validation": validation,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1988,16 +2030,12 @@ def update_node_setting(
             "available_paths": _list_field_paths(settings),
         }
 
-    resp = _put_workflow_blocks(workflow_id, wf)
-    err = next((b.get("node_config_error") for b in resp.get("blocks", []) if b["id"] == node_id), None)
-
+    # v0.2.16: per-node PUT instead of full-workflow PUT (avoids 413 on big workflows)
+    mutation = _put_node_and_validate(workflow_id, node_id, target, validate_after)
     result = {
-        "ok": err is None and not resp.get("workflowConfigError"),
         "node_id": node_id,
         "field_path": field_path,
-        "node_config_error": err,
-        "workflowConfigError": resp.get("workflowConfigError"),
-        "validation": _maybe_validate(workflow_id, validate_after),
+        **mutation,
     }
 
     if verify and result["ok"]:
@@ -2165,16 +2203,12 @@ def update_magic_node(
             "node_id": node_id,
         }]
 
-    resp = _put_workflow_blocks(workflow_id, wf)
-    err = next((b.get("node_config_error") for b in resp.get("blocks", []) if b["id"] == node_id), None)
+    # v0.2.16: per-node PUT instead of full-workflow PUT (avoids 413 on big workflows)
+    mutation = _put_node_and_validate(workflow_id, node_id, target, validate_after)
     return {
-        "ok": err is None and not resp.get("workflowConfigError"),
         "node_id": node_id,
-        "node_config_error": err,
-        "workflowConfigError": resp.get("workflowConfigError"),
-        "isRunable": resp.get("isRunable"),
         "lint_warnings": lint_warnings,
-        "validation": _maybe_validate(workflow_id, validate_after),
+        **mutation,
     }
 
 
@@ -2232,16 +2266,13 @@ def update_ai_prompt(
 
     _walk_settings_set(settings, top_path.split("/"), new_prompt)
 
-    resp = _put_workflow_blocks(workflow_id, wf)
-    err = next((b.get("node_config_error") for b in resp.get("blocks", []) if b["id"] == node_id), None)
+    # v0.2.16: per-node PUT instead of full-workflow PUT (avoids 413 on big workflows)
+    mutation = _put_node_and_validate(workflow_id, node_id, target, validate_after)
     return {
-        "ok": err is None and not resp.get("workflowConfigError"),
         "node_id": node_id,
         "field_path": top_path,
         "score": top_score,
-        "node_config_error": err,
-        "workflowConfigError": resp.get("workflowConfigError"),
-        "validation": _maybe_validate(workflow_id, validate_after),
+        **mutation,
     }
 
 
@@ -2548,16 +2579,13 @@ def set_node_output_schema(
         "node_id": node_id,
     }]
 
-    resp = _put_workflow_blocks(workflow_id, wf)
-    err = next((b.get("node_config_error") for b in resp.get("blocks", []) if b["id"] == node_id), None)
+    # v0.2.16: per-node PUT instead of full-workflow PUT (avoids 413 on big workflows)
+    mutation = _put_node_and_validate(workflow_id, node_id, target, validate_after)
     return {
-        "ok": err is None and not resp.get("workflowConfigError"),
         "node_id": node_id,
         "column_count": len(col_names),
         "columns": col_names,
-        "node_config_error": err,
-        "workflowConfigError": resp.get("workflowConfigError"),
-        "validation": _maybe_validate(workflow_id, validate_after),
+        **mutation,
     }
 
 

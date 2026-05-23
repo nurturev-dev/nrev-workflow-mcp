@@ -166,9 +166,10 @@ def test_add_edge_allows_magic_node_fan_in_to_df_handles():
         {"id": "src-b", "toBlocks": []},
         {"id": "magic", "toBlocks": []},
     ]
+    # v0.2.16: add_edge now uses api.put_node (per-block) instead of
+    # _put_workflow_blocks (full-workflow PUT). Mock the new path.
     with patch("nrev_wf_mcp.server.api.get_workflow", return_value=_wf_with_blocks(blocks)), \
-         patch("nrev_wf_mcp.server.api._put_workflow_blocks") if False else \
-         patch("nrev_wf_mcp.server._put_workflow_blocks", return_value={"workflowConfigError": None, "isRunable": True}), \
+         patch("nrev_wf_mcp.server.api.put_node", return_value={}), \
          patch("nrev_wf_mcp.server._maybe_validate", return_value=None):
         result = add_edge(
             workflow_id="wf-1",
@@ -213,8 +214,10 @@ def test_add_edge_allows_second_edge_when_opt_in_set():
         {"id": "src-b", "toBlocks": []},
         {"id": "target", "toBlocks": []},
     ]
+    # v0.2.16: add_edge now uses api.put_node (per-block) instead of
+    # _put_workflow_blocks (full-workflow PUT). Mock the new path.
     with patch("nrev_wf_mcp.server.api.get_workflow", return_value=_wf_with_blocks(blocks)), \
-         patch("nrev_wf_mcp.server._put_workflow_blocks", return_value={"workflowConfigError": None, "isRunable": True}), \
+         patch("nrev_wf_mcp.server.api.put_node", return_value={}), \
          patch("nrev_wf_mcp.server._maybe_validate", return_value=None):
         result = add_edge(
             workflow_id="wf-1",
