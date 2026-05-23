@@ -1,10 +1,10 @@
 # nrev-workflow-mcp
 
-A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow API as **48 MCP tools** — build, debug, and operate workflows from inside any Claude session.
+A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow API as **49 MCP tools** — build, debug, and operate workflows from inside any Claude session.
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.18** ([release notes](#release-notes)).
+Current version: **v0.2.19** ([release notes](#release-notes)).
 
 ---
 
@@ -17,7 +17,7 @@ In any Claude Code session:
 /plugin install nrev-wf@nrev
 ```
 
-Restart Claude Code. Run `/mcp` and you should see `nrev-wf` with 48 tools.
+Restart Claude Code. Run `/mcp` and you should see `nrev-wf` with 49 tools.
 
 ### Prerequisites (one-time)
 
@@ -162,13 +162,13 @@ nrev-workflow-mcp/
 
 ---
 
-## Tools (48)
+## Tools (49)
 
 | Group | Tools |
 |---|---|
 | **Auth & billing** | `set_jwt`, `get_auth_status`, `get_credit_balance` |
 | **Read / inspect** | `get_workflow`, `list_workflows`, `get_node`, `get_workflow_graph`, `list_node_settings`, `get_node_neighbors`, `trace_path` |
-| **Discovery** | `list_node_definitions`, `get_node_definition`, `list_connections`, `list_connection_apps`, `list_field_options` |
+| **Discovery** | `list_node_definitions`, `get_node_definition`, `list_connections`, `list_connection_apps`, `list_field_options`, `get_node_dynamic_fields` |
 | **Validate** | `validate_workflow`, `validate_custom_code` |
 | **Build & lifecycle** | `create_workflow`, `attach_node`, `attach_magic_node`, `attach_python_block`, `paste_nodes`, `duplicate_workflow`, `clone_node`, `publish_workflow`, `get_publish_status`, `delete_workflow` |
 | **Edit** | `update_node_setting`, `update_magic_node`, `update_ai_prompt`, `set_node_output_schema` |
@@ -225,6 +225,22 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.19 — Cross-tenant Pipedream node configuration UNBLOCKED
+**The big one for customer-tenant use cases.** Previously we couldn't fully configure Slack / Calendar / Sheets etc. when using a teammate's OAuth connection — cascading dropdowns (channels, calendars, worksheets) appeared to refuse cross-tenant context. v0.2.19 surfaces the platform's actual cross-tenant-friendly endpoint and makes everything work end-to-end.
+
+- **New tool `get_node_dynamic_fields(workflow_id, node_id)`** wraps `POST /nodes/updated-config-and-status` — the same endpoint the platform UI calls when a Pipedream node's settings change to recompute the form schema. Returns the action's full field definitions including dynamic dependent fields (e.g. for Slack New Message, after the connection is bound the response includes `conversations` for the channel dropdown, `resolveNames`, `ignoreBots`, etc.). **CRITICAL — works cross-tenant**, unlike `/nodes/reload-props` which we found 400s on cross-tenant connections.
+- **`list_field_options` confirmed cross-tenant** when called with the correct action-specific field name from `get_node_dynamic_fields`. Live-tested: returned 189 Slack channels for sayanta's cross-tenant connection from common.dev's JWT. The P2.5 stress-test agent's earlier blocker was using guessed field names (`channel`, `channelId`); the actual name varies per action and is only knowable from the dynamic-fields schema.
+- **Recommended discovery flow for Pipedream nodes** (now documented in the `get_node_dynamic_fields` docstring):
+  1. `attach_node` with a placeholder connection field (try `pipedream-<app>-<action>-<app>` or `-<app>_connection_id` — the latter is more common for trigger/listener actions)
+  2. `get_node_dynamic_fields` → get the full schema + a `dropdown_field_names` list
+  3. For each dropdown field, `list_field_options` with the correct field name → enumerate options
+  4. `update_node_setting` to set the chosen values
+- **Updates `list_field_options` docstring** to point at `get_node_dynamic_fields` as the discovery prerequisite.
+
+Tool count: 48 → 49. Tests: 219 → 225.
+
+**Customer-tenant impact**: agents acting on behalf of `support@yourco` who need to configure Slack/Sheets/Calendar/etc. against a customer's teammates' OAuth connections can now do it all end-to-end. No more "must each user OAuth their own" workaround.
 
 ### v0.2.18 — Pipedream stress-test cleanup (cross-user connections + edge orphan refresh + delete_node ok-flag)
 Live Phase-2 testing against Gmail/Slack/Sheets/Calendar/Midbound/LinkedIn surfaced four bugs and several platform quirks worth documenting.

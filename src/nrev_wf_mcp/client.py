@@ -176,6 +176,13 @@ def field_options(
     NOTE: `nodeId` is for logging only — can be any UUID, no need to point
     at a real existing node. Use the about-to-be-created node's UUID for
     fresh attach flows.
+
+    CROSS-TENANT (v0.2.19): works for connections owned by ANY teammate
+    in the tenant, IF you use the action-specific field_name. The right
+    field name varies per Pipedream action (e.g.
+    `pipedream-slack_v2-slack_v2_new_message_in_channels-conversations`
+    for Slack New Message channels). Use `updated_node_config` to
+    discover the correct field names before calling this.
     """
     body = {
         "nodeId": node_id,
@@ -186,6 +193,57 @@ def field_options(
     if search is not None:
         body["search"] = search
     return request("POST", "/nodes/field-options", json_body=body)
+
+
+def updated_node_config(
+    node_id: str,
+    node_definition_id: str,
+    field_name_changed: str,
+    setting_field_values: list[dict],
+    settings_schema: Optional[list[dict]] = None,
+) -> dict:
+    """POST /nodes/updated-config-and-status — get the action's full field
+    schema given the current settings.
+
+    This is the endpoint the platform UI calls when a Pipedream action's
+    settings change (e.g. user picks a connection) to materialize the
+    dependent fields (channel dropdown, calendar dropdown, etc.).
+
+    v0.2.19 discovery — this is THE endpoint that unlocks the customer-
+    tenant use case: it works cross-tenant (returns the schema even when
+    the connection_id is owned by a different user in the tenant),
+    unlike `/nodes/reload-props` which 400s on cross-tenant connections.
+
+    Returns: {nodeId, nodeDefinition: {fields: [...]}, availableOptions,
+    settingFieldValues}. Each field in `nodeDefinition.fields` carries:
+      - name              — the exact field_name to use in field_options
+      - type              — app_connection / multi_select / boolean / string / ...
+      - label             — UI display label
+      - required          — bool
+      - placeholder       — helper text
+      - conditionalVisibility — depends_on rules
+      - inputTypes[].dataSource.endpoint — where to fetch options from
+                            (typically `/nodes/field-options` for dropdowns)
+
+    Args:
+        node_id:             the workflow's node UUID
+        node_definition_id:  the catalog typeId
+        field_name_changed:  the field the caller just modified (commonly
+                             the connection_id field after picking a
+                             connection). The platform recomputes the
+                             schema based on this trigger.
+        setting_field_values: current settings_field_values from the
+                             stored node — pass the full list.
+        settings_schema:     optional pre-known schema; usually [] is fine.
+    """
+    body = {
+        "nodeId": node_id,
+        "nodeDefinitionId": node_definition_id,
+        "fieldNameChanged": field_name_changed,
+        "settingFieldValues": setting_field_values,
+        "settingsSchema": settings_schema or [],
+    }
+    return request("POST", "/nodes/updated-config-and-status", json_body=body)
 
 
 def list_connection_apps(

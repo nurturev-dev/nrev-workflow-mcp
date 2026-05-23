@@ -3050,6 +3050,15 @@ def list_field_options(
     settings on the node must be set first; the platform reads them to scope
     the options.
 
+    CROSS-TENANT (v0.2.19): WORKS for connections owned by ANY teammate in
+    the tenant, IF you pass the action-specific `field_name`. The right
+    field name varies per Pipedream action (e.g. for Slack New Message,
+    the channel field is `pipedream-slack_v2-slack_v2_new_message_in_channels-conversations`,
+    NOT `channel` or `channelId` as you might guess). The reliable way to
+    get the right field name is **`get_node_dynamic_fields(workflow_id,
+    node_id)`** (v0.2.19) — it returns the full action schema. Try that
+    first if you're unsure what fields exist.
+
     Use cases:
       - Discover sheets / worksheets / channels / folders available for an
         app-backed node before configuring it
@@ -3077,6 +3086,132 @@ def list_field_options(
         "count": len(opts),
         "options": [{"label": o.get("label"), "value": o.get("value")} for o in opts],
         "errors": resp.get("errors") or [],
+    }
+
+
+@mcp.tool()
+def get_node_dynamic_fields(
+    workflow_id: str,
+    node_id: str,
+    field_name_changed: Optional[str] = None,
+) -> dict:
+    """Get the FULL field schema for a Pipedream-action node, including
+    dynamic fields that materialize after a connection is bound.
+
+    This is the v0.2.19 breakthrough that unlocks the customer-tenant
+    use case. Wraps `POST /nodes/updated-config-and-status` — the same
+    endpoint the platform's UI calls when a Pipedream node's settings
+    change to recompute the form schema.
+
+    Why you need this: Pipedream actions have field names that vary per
+    action and are NOT discoverable from the catalog alone. For example:
+      - Gmail Send Email connection field: pipedream-gmail-gmail_send_email-gmail
+      - Slack Send Message connection field: pipedream-slack_v2-slack_v2_send_message-slack_v2
+      - Slack New Message channel field: pipedream-slack_v2-slack_v2_new_message_in_channels-conversations
+      - (All three differ in the trailing segment — there's no formula.)
+
+    Also: dynamic dropdowns (Slack channels, Calendar IDs, Sheets
+    worksheets, etc.) are listed in the response as fields with
+    `inputTypes[].dataSource.endpoint = "/nodes/field-options"`. Use
+    `list_field_options(field_name=<that field's name>)` to fetch the
+    actual values.
+
+    CRITICAL — works cross-tenant. Unlike `/nodes/reload-props` (which
+    returns "No valid connection found in settings" for connections
+    owned by other tenant users), this endpoint accepts cross-tenant
+    bindings and returns the full schema. Confirmed live with sayanta's
+    Slack connection from common.dev's JWT.
+
+    Recommended discovery flow for a Pipedream node:
+      1. attach_node with placeholder settings = {connection_field: connection_id}.
+         Guess the connection field name (try common patterns like
+         `pipedream-<app>-<action>-<app>`); if attach fails with
+         "Connection not found", try `pipedream-<app>-<action>-<app>_connection_id`.
+      2. get_node_dynamic_fields(workflow_id, node_id) → returns nodeDefinition.fields.
+      3. From the response, find the connection field's actual name (it
+         has `type: "app_connection"`) and any dependent dropdowns.
+      4. For each dropdown field with a dataSource pointing to
+         /nodes/field-options, call list_field_options(field_name=<that name>).
+      5. Update settings via update_node_setting using the correct field names.
+
+    `field_name_changed` defaults to the connection field if not specified.
+
+    Returns:
+      {
+        node_id, node_definition_id,
+        fields: [{name, type, label, required, placeholder, conditionalVisibility, dataSource, inputTypes}, ...],
+        dropdown_fields: [list of fields with type=multi_select or app_connection or with dataSource],
+        available_options, setting_field_values
+      }
+    """
+    wf = api.get_workflow(workflow_id)
+    target = next((b for b in wf["blocks"] if b["id"] == node_id), None)
+    if target is None:
+        raise ValueError(f"node {node_id} not in workflow {workflow_id}")
+
+    sfv = target.get("settings_field_values") or []
+    # Default field_name_changed: the first app_connection-shaped field name
+    # we can guess from the current settings (looking for connection-id-like
+    # field names). If nothing fits, use the first field name available.
+    if not field_name_changed:
+        for s in sfv:
+            fn = s.get("field_name") or ""
+            if "connection" in fn.lower() or fn.endswith("-gmail") or fn.endswith("-slack_v2"):
+                field_name_changed = fn
+                break
+        if not field_name_changed and sfv:
+            field_name_changed = sfv[0].get("field_name")
+        if not field_name_changed:
+            raise ValueError(
+                "Cannot infer field_name_changed — node has no settings. "
+                "Attach the node with at least a placeholder connection_id "
+                "setting first, then call this tool."
+            )
+
+    resp = api.updated_node_config(
+        node_id=node_id,
+        node_definition_id=target.get("typeId", ""),
+        field_name_changed=field_name_changed,
+        setting_field_values=sfv,
+        settings_schema=[],
+    )
+
+    fields = (resp.get("nodeDefinition") or {}).get("fields") or []
+    dropdowns = [
+        f for f in fields
+        if f.get("type") in ("app_connection", "multi_select", "select")
+        or (f.get("dataSource") and f["dataSource"].get("endpoint"))
+        or any(
+            (it.get("dataSource") or {}).get("endpoint")
+            for it in (f.get("inputTypes") or [])
+        )
+    ]
+    return {
+        "node_id": resp.get("nodeId"),
+        "node_definition_id": target.get("typeId"),
+        "field_count": len(fields),
+        "fields": [
+            {
+                "name": f.get("name"),
+                "type": f.get("type"),
+                "label": f.get("label"),
+                "required": f.get("required"),
+                "placeholder": f.get("placeholder"),
+                "default_value": f.get("defaultValue"),
+                "conditional_visibility": f.get("conditionalVisibility"),
+                "data_source": f.get("dataSource"),
+                "input_types": f.get("inputTypes"),
+            }
+            for f in fields
+        ],
+        "dropdown_field_names": [f.get("name") for f in dropdowns],
+        "available_options": resp.get("availableOptions"),
+        "setting_field_values": resp.get("settingFieldValues"),
+        "note": (
+            "Use `list_field_options(workflow_id, node_id, field_name=<name>)` "
+            "for each entry in `dropdown_field_names` (excluding the connection "
+            "field itself) to enumerate available options. Works cross-tenant."
+        ),
     }
 
 
