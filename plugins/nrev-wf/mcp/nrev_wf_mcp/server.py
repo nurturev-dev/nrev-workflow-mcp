@@ -1858,13 +1858,25 @@ def add_edge(
     # stayed isOrphan=True and execution failed with "Node is orphan". The
     # platform doesn't auto-recompute isOrphan when a sibling block's
     # toBlocks gains a new edge — we have to mutate the target ourselves.
+    #
+    # v0.2.21: ALSO flip target's isTrigger=False when wiring downstream of
+    # an existing root. Pre-fix, if both source AND target had isTrigger=True,
+    # the workflow ended up with two start nodes and the UI got confused
+    # (validated by user session: "the scheduler was still a start node not
+    # a trigger node"). The platform allows multiple start nodes, but a node
+    # that has a parent should NOT also be a start node.
     tgt = blocks_by_id[target_node_id]
     target_needs_refresh = (
         tgt.get("isOrphan")
         or not (tgt.get("inputs") or [])  # missing or empty inputs skeleton
+        or tgt.get("isTrigger")  # v0.2.21: extra refresh trigger
     )
+    target_isTrigger_flipped = False
     if target_needs_refresh:
         tgt["isOrphan"] = False
+        if tgt.get("isTrigger"):
+            tgt["isTrigger"] = False
+            target_isTrigger_flipped = True
         if not (tgt.get("inputs") or []):
             tgt["inputs"] = [{
                 "columns": [], "columns_metadata": None, "file": "",
@@ -1881,6 +1893,7 @@ def add_edge(
         "edge_existed": False,
         "edge_added": True,
         "target_isOrphan_refreshed": target_needs_refresh,
+        "target_isTrigger_flipped": target_isTrigger_flipped,  # v0.2.21
         "node_config_error": None,
         "workflowConfigError": workflow_err,
         "isRunable": is_runable,
@@ -3446,9 +3459,420 @@ def get_node_dynamic_fields(
         "available_options": resp.get("availableOptions"),
         "setting_field_values": resp.get("settingFieldValues"),
         "note": (
-            "Use `list_field_options(workflow_id, node_id, field_name=<name>)` "
-            "for each entry in `dropdown_field_names` (excluding the connection "
-            "field itself) to enumerate available options. Works cross-tenant."
+            "STATIC fields only (5 for Add Single Row). For Pipedream DYNAMIC "
+            "fields (col_NNNN per sheet column, dynamic_props_id, array fields "
+            "like updation_criteria), call `reload_pipedream_props` — that's "
+            "the endpoint the platform's UI calls to materialize the dynamic "
+            "schema. v0.2.21 ships reload_pipedream_props for that purpose."
+        ),
+    }
+
+
+# ─── v0.2.21: Pipedream dynamic-props (col_NNNN + dynamic_props_id) ─────────
+
+
+@mcp.tool()
+def reload_pipedream_props(
+    workflow_id: str,
+    node_id: str,
+    field_name_changed: Optional[str] = None,
+) -> dict:
+    """Get the FULL DYNAMIC field schema for a Pipedream action — including
+    `col_NNNN` per sheet column (with `label` = the sheet header), the
+    auto-issued `dynamic_props_id` token, and array-typed fields like
+    `updation_criteria` / `fields_to_update` for Update Row.
+
+    v0.2.21 — wraps `POST /nodes/reload-props`. **This is what unlocks
+    Sheets writes and updates end-to-end** (without it, the platform
+    stores values but the action runtime ignores them).
+
+    DIFFERENT FROM `get_node_dynamic_fields`:
+      - `get_node_dynamic_fields` calls `/nodes/updated-config-and-status`
+        and returns only the STATIC fields (e.g. 5 for Add Single Row:
+        connection / drive / sheetId / worksheetId / hasHeaders).
+      - `reload_pipedream_props` calls `/nodes/reload-props` and returns
+        the FULL dynamic schema (e.g. 13 fields for Add Single Row,
+        adding `col_0000`..`col_NNNN` plus `dynamic_props_id`).
+      - Use BOTH: `get_node_dynamic_fields` for cross-tenant connection
+        validation (works on any Pipedream node); `reload_pipedream_props`
+        for unlocking col_NNNN + dynamic_props_id for SheetsWrite-style
+        nodes.
+
+    Returns:
+        {
+          "node_id": str,
+          "component_id": "google_sheets-add-single-row" | ...,
+          "dynamic_props_id": "dyp_VwUD0ppk",          ← AUTO-ISSUED token
+          "fields": [{name, type, label, required, ...}],
+          "col_to_label": {"col_0000": "timestamp", ...},  ← mapping for auto-wiring
+          "array_fields": [name, ...],  ← updation_criteria etc.
+          "has_dynamic_props": bool,  ← False if action has no dyn props
+          "errors": list[str],
+        }
+
+    GOTCHAS:
+      - NOT idempotent: every call issues a fresh `dynamic_props_id`.
+        Call ONCE per real settings change (connection / sheet / worksheet
+        / hasHeaders). Cache the token. Subsequent unrelated edits should
+        NOT re-call this.
+      - For Pipedream nodes without dynamic props (e.g. Get Values in
+        Range — its schema is static), returns
+        `errors: ["additionalProps not a function"]` and 0 fields. The
+        `has_dynamic_props` flag is False in that case.
+      - The node must already exist in the workflow (the platform
+        validates node-existence). Attach the block first, then call.
+
+    Typical use (Add Single Row downstream of a GVR):
+      1. attach_node(Add Single Row, settings={5 static fields})
+      2. reload_pipedream_props → get dynamic_props_id + col_to_label
+      3. update_node_setting to persist dynamic_props_id + col_NNNN
+         templates (use auto_map_pipedream_columns helper)
+      4. add_edge(GVR -> Add Single Row)
+      5. save_and_execute
+    """
+    wf = api.get_workflow(workflow_id)
+    target = next((b for b in wf["blocks"] if b["id"] == node_id), None)
+    if target is None:
+        raise ValueError(f"node {node_id} not in workflow {workflow_id}")
+
+    sfv = target.get("settings_field_values") or []
+    # Default field_name_changed: anything sensible. The endpoint uses it
+    # as the trigger field but otherwise doesn't validate.
+    if not field_name_changed:
+        if sfv:
+            field_name_changed = sfv[0].get("field_name") or ""
+        else:
+            raise ValueError(
+                "Cannot infer field_name_changed — node has no settings. "
+                "Attach the node with at least placeholder settings first."
+            )
+
+    # Flatten settings to the simple {field_name, field_value} pairs the
+    # reload-props endpoint wants
+    settings_pairs = _settings_as_value_array(sfv)
+
+    resp = api.reload_pipedream_props(
+        node_id=node_id,
+        node_definition_id=target.get("typeId", ""),
+        field_name_changed=field_name_changed,
+        settings=settings_pairs,
+    )
+
+    fields = resp.get("fields") or []
+    errors = resp.get("errors") or []
+    # Detect "no dynamic props" — endpoint returns errors with this string
+    has_dynamic_props = not any(
+        "additionalProps not a function" in str(e) for e in errors
+    )
+
+    # Extract dynamic_props_id (auto-issued in defaultValue)
+    dyp = None
+    for f in fields:
+        name = f.get("name") or ""
+        if name.endswith("dynamic_props_id"):
+            dyp = f.get("defaultValue")
+            break
+
+    # Build col_NNNN → label mapping (for auto-mapping upstream columns)
+    col_to_label: dict[str, str] = {}
+    for f in fields:
+        name = f.get("name") or ""
+        # Match the trailing col_NNNN segment (col_0000 is 8 chars: c,o,l,_,0,0,0,0)
+        seg = name.rsplit("-", 1)[-1] if "-" in name else name
+        if seg.startswith("col_") and len(seg) == 8 and seg[4:].isdigit():
+            label = f.get("label")
+            if label:
+                col_to_label[seg] = label
+
+    # Identify array-typed fields (for Update Row / Upsert)
+    array_fields = [f.get("name") for f in fields if f.get("type") == "array"]
+
+    return {
+        "node_id": node_id,
+        "component_id": resp.get("componentId"),
+        "dynamic_props_id": dyp,
+        "has_dynamic_props": has_dynamic_props,
+        "fields": [
+            {
+                "name": f.get("name"),
+                "type": f.get("type"),
+                "label": f.get("label"),
+                "required": f.get("required"),
+                "placeholder": f.get("placeholder"),
+                "default_value": f.get("defaultValue"),
+                "conditional_visibility": f.get("conditionalVisibility"),
+                "array_item_schema": f.get("array_item_schema"),
+            }
+            for f in fields
+        ],
+        "col_to_label": col_to_label,
+        "array_fields": array_fields,
+        "errors": errors,
+        "note": (
+            "Use the `dynamic_props_id` value to set the node's "
+            "dynamic_props_id field. Use `col_to_label` to auto-map "
+            "upstream columns to col_NNNN templates (see "
+            "auto_map_pipedream_columns helper)."
+        ),
+    }
+
+
+@mcp.tool()
+def auto_map_pipedream_columns(
+    workflow_id: str,
+    node_id: str,
+    template_format: str = "{{{{{label}}}}}",
+) -> dict:
+    """For an Add Single Row node downstream of a Sheets read, auto-fill
+    the `col_NNNN` fields with `{{<upstream_header_name>}}` templates.
+
+    v0.2.21 — uses `reload_pipedream_props` to discover col_NNNN.label
+    (which IS the destination sheet's header name), then wraps each in a
+    Jinja-like template that references the upstream column of the same
+    name. At runtime, Pipedream substitutes the value from each upstream
+    row per template.
+
+    Also persists the auto-issued `dynamic_props_id` to the node's
+    settings, so the node is ready to execute.
+
+    Args:
+      workflow_id, node_id: target Add Single Row block (already attached)
+      template_format:      f-string with `{label}` placeholder. Default
+                            `"{{{{{label}}}}}"` produces `{{timestamp}}`,
+                            `{{who}}`, etc. Override if your upstream
+                            emits prefixed columns (e.g. `"{{{{row.{label}}}}}"`
+                            → `{{row.timestamp}}`).
+
+    Returns: {col_to_label, dynamic_props_id, applied: list[{col, template, ok}]}.
+
+    Errors if the node has no dynamic props (e.g. it's Get Values in Range,
+    not Add Single Row).
+    """
+    schema = reload_pipedream_props(workflow_id, node_id)
+    if not schema.get("has_dynamic_props"):
+        return {
+            "ok": False,
+            "message": (
+                f"Node {node_id} has no dynamic Pipedream props "
+                f"(component={schema.get('component_id')!r}). "
+                f"Auto-mapping only works for Add Single Row / similar nodes "
+                f"that expose col_NNNN fields per sheet column. Errors: "
+                f"{schema.get('errors')}"
+            ),
+        }
+    col_to_label = schema.get("col_to_label") or {}
+    dyp = schema.get("dynamic_props_id")
+    if not col_to_label:
+        return {
+            "ok": False,
+            "message": (
+                "reload-props returned no col_NNNN fields. Likely the static "
+                "settings (connection / sheet / worksheet / hasHeaders) aren't "
+                "fully bound yet — set them first via update_node_setting."
+            ),
+            "errors": schema.get("errors"),
+        }
+
+    # Get the node's component-id prefix for building col_NNNN field names
+    component_prefix = None
+    for f in schema.get("fields") or []:
+        nm = f.get("name") or ""
+        if "-col_" in nm:
+            component_prefix = nm.rsplit("-col_", 1)[0] + "-"
+            break
+    if not component_prefix:
+        return {"ok": False, "message": "Could not derive component prefix from col_NNNN field names."}
+
+    applied = []
+    # Persist dynamic_props_id first
+    if dyp:
+        dyp_path = f"{component_prefix}dynamic_props_id"
+        res = update_node_setting(workflow_id, node_id, dyp_path, dyp,
+                                  validate_after=False, add_if_missing=True)
+        applied.append({"path": dyp_path, "value": dyp, "ok": res.get("ok", False)})
+
+    # Persist each col_NNNN template
+    for col, label in sorted(col_to_label.items()):
+        template = template_format.format(label=label)
+        path = f"{component_prefix}{col}"
+        res = update_node_setting(workflow_id, node_id, path, template,
+                                  validate_after=False, add_if_missing=True)
+        applied.append({"path": path, "value": template, "ok": res.get("ok", False)})
+
+    return {
+        "ok": all(a["ok"] for a in applied),
+        "col_to_label": col_to_label,
+        "dynamic_props_id": dyp,
+        "applied": applied,
+        "note": (
+            "Templates reference upstream columns by header name. Each "
+            "upstream row will be one Pipedream invocation, writing one "
+            "row to the destination sheet."
+        ),
+    }
+
+
+@mcp.tool()
+def configure_update_row(
+    workflow_id: str,
+    node_id: str,
+    criteria: list[dict],
+    updates: list[dict],
+    add_if_not_present: bool = False,
+) -> dict:
+    """Configure a Pipedream Update Row block end-to-end.
+
+    v0.2.21 — handles the platform's array-field envelope correctly:
+    `updation_criteria` and `fields_to_update` are stored as LISTS OF
+    LISTS of sub-field envelopes, with column values referencing
+    `col_NNNN` slugs (NOT the human-readable header names).
+
+    Pythonic interface: caller passes `criteria` and `updates` as lists
+    of `{"header": "<sheet header name>", "value": "<literal or {{template}}>"}`
+    dicts. This helper:
+      1. Calls reload_pipedream_props to discover col_NNNN.label → slug mapping
+       AND the fresh `dynamic_props_id`
+      2. Resolves each `header` to the corresponding `col_NNNN` slug
+      3. Builds the correct list-of-lists envelope shape for both array fields
+      4. PUTs the full settings (5 static + dyp_ + criteria + updates + add_if_not_present)
+
+    Args:
+      workflow_id, node_id: target Update Row block (already attached, 5 static fields bound)
+      criteria:    list of {"header": "<name>", "value": "<literal or {{template}}>"}.
+                   Multiple criteria are AND'd by the platform.
+                   Example: [{"header": "who", "value": "ana@example.com"}]
+      updates:     list of {"header": "<name>", "value": "<new value>"} for fields to set
+                   Example: [{"header": "status", "value": "replied"}]
+      add_if_not_present: if True, Update Row acts as upsert — appends a new row when
+                          criteria matches nothing. Default False (skip when no match).
+
+    Returns: {ok, dynamic_props_id, criteria_resolved, updates_resolved, message}.
+    """
+    schema = reload_pipedream_props(workflow_id, node_id)
+    if not schema.get("has_dynamic_props"):
+        return {"ok": False, "message": f"Node has no dynamic props (component={schema.get('component_id')})."}
+    col_to_label = schema.get("col_to_label") or {}
+    if not col_to_label:
+        return {"ok": False, "message": "reload-props returned no col_NNNN fields; bind static settings first."}
+    # Build header → col_NNNN reverse map
+    label_to_col = {label: col for col, label in col_to_label.items()}
+    dyp = schema.get("dynamic_props_id")
+
+    # Component prefix (e.g. pipedream-google_sheets-google_sheets_update_row-)
+    component_prefix = None
+    for f in schema.get("fields") or []:
+        nm = f.get("name") or ""
+        if nm.endswith("dynamic_props_id"):
+            component_prefix = nm[:-len("dynamic_props_id")]
+            break
+    if not component_prefix:
+        return {"ok": False, "message": "Could not derive component prefix from schema."}
+
+    # Resolve header → col_NNNN
+    def _resolve(items, *, col_key, val_key):
+        out = []
+        resolved_log = []
+        for item in items:
+            header = item.get("header")
+            value = item.get("value")
+            col = label_to_col.get(header)
+            if not col:
+                return None, f"Header {header!r} not found in sheet (available: {sorted(label_to_col.keys())})"
+            resolved_log.append({"header": header, "col": col, "value": value})
+            out.append([
+                {"field_name": f"{component_prefix}{col_key}",
+                 "field_value": col, "fieldLabel": header, "error": None},
+                {"field_name": f"{component_prefix}{val_key}",
+                 "field_value": value, "error": None},
+            ])
+        return out, resolved_log
+
+    criteria_envelope, criteria_log = _resolve(criteria, col_key="column_to_match", val_key="value_to_match")
+    if criteria_envelope is None:
+        return {"ok": False, "message": f"criteria error: {criteria_log}"}
+    updates_envelope, updates_log = _resolve(updates, col_key="column_to_update", val_key="value_to_update")
+    if updates_envelope is None:
+        return {"ok": False, "message": f"updates error: {updates_log}"}
+
+    # PUT each setting via update_node_setting
+    applied = []
+    # dynamic_props_id
+    if dyp:
+        r = update_node_setting(workflow_id, node_id, f"{component_prefix}dynamic_props_id",
+                                 dyp, validate_after=False, add_if_missing=True)
+        applied.append({"path": "dynamic_props_id", "ok": r.get("ok", False)})
+    # updation_criteria
+    r = update_node_setting(workflow_id, node_id, f"{component_prefix}updation_criteria",
+                             criteria_envelope, validate_after=False, add_if_missing=True)
+    applied.append({"path": "updation_criteria", "ok": r.get("ok", False)})
+    # fields_to_update
+    r = update_node_setting(workflow_id, node_id, f"{component_prefix}fields_to_update",
+                             updates_envelope, validate_after=False, add_if_missing=True)
+    applied.append({"path": "fields_to_update", "ok": r.get("ok", False)})
+    # add_if_not_present
+    r = update_node_setting(workflow_id, node_id, f"{component_prefix}add_if_not_present",
+                             bool(add_if_not_present), validate_after=True, add_if_missing=True)
+    applied.append({"path": "add_if_not_present", "ok": r.get("ok", False)})
+
+    return {
+        "ok": all(a["ok"] for a in applied),
+        "dynamic_props_id": dyp,
+        "criteria_resolved": criteria_log,
+        "updates_resolved": updates_log,
+        "applied": applied,
+        "note": (
+            "Update Row is now configured. Execute via save_and_execute. "
+            "Per upstream row, Pipedream substitutes {{templates}} and runs "
+            "the action once. Each invocation returns "
+            "payload.updated_rows_indices listing the sheet rows mutated."
+        ),
+    }
+
+
+@mcp.tool()
+def save_and_execute(
+    workflow_id: str,
+    target_node_id: str,
+) -> dict:
+    """Atomic save-then-execute. Persists the current workflow state AND
+    kicks off execution of `target_node_id` in one server-side call.
+
+    v0.2.21 — wraps `POST /workflows/{wf}/nodes/{n}/update-workflow-and-execute`,
+    the same endpoint the platform's UI "Run Workflow" button uses.
+
+    Why prefer this over `partial_execute`:
+      - `partial_execute` only calls the execute endpoint. If you made
+        unsaved changes to the workflow first, the execution sees a
+        stale snapshot — silent skips, wrong outputs.
+      - `save_and_execute` PUTs the latest workflow state THEN runs,
+        all in one transaction. Avoids the class of stale-state bugs.
+
+    Use this after `auto_map_pipedream_columns` or `configure_update_row`
+    when you want to immediately run the configured block.
+
+    Returns: {ok, execution_id, status, response}. Poll status via
+    `tail_execution(execution_id, wait_until="block_completed", target_block_id=<id>)`.
+    """
+    wf = api.get_workflow(workflow_id)
+    target = next((b for b in wf["blocks"] if b["id"] == target_node_id), None)
+    if target is None:
+        raise ValueError(f"target_node_id {target_node_id} not in workflow {workflow_id}")
+
+    try:
+        resp = api.update_workflow_and_execute(workflow_id, target_node_id, wf)
+    except Exception as e:
+        return {"ok": False, "stage": "execute", "message": str(e)}
+
+    execution = (resp.get("execution") or {}).get("response") or {}
+    return {
+        "ok": True,
+        "execution_id": execution.get("id"),
+        "status": execution.get("status"),
+        "started_at": execution.get("startedAt"),
+        "note": (
+            "Poll with tail_execution(execution_id, wait_until='block_completed', "
+            f"target_block_id='{target_node_id}'). For Pipedream nodes, also "
+            "check the row output via get_node_output to confirm payload."
         ),
     }
 
@@ -3937,6 +4361,24 @@ def attach_node(
         # Root block: always a start node, listener auto from catalog.
         resolved_is_trigger = is_trigger if is_trigger is not None else True
         resolved_is_listener = is_listener if is_listener is not None else (auto_listener or False)
+
+    # v0.2.21 — Scheduler is_listener=False guard. Scheduler-as-non-listener is
+    # a footgun: it becomes a "start node that doesn't actually fire", which
+    # makes the UI confused and the workflow effectively dead. The caller was
+    # almost certainly trying to do a one-off test run — point them at the
+    # right pattern (real data source as root, OR Scheduler+leave-listener-on
+    # for cron). v0.2.20 session burned ~10 min of debugging on this.
+    SCHEDULER_TYPEID = "68da2fb4-8295-4568-9415-c47de58e6224"
+    if type_id == SCHEDULER_TYPEID and is_listener is False:
+        raise ValueError(
+            "Scheduler with is_listener=False is a footgun — it becomes a "
+            "start node that doesn't actually fire. For one-off / ad-hoc "
+            "workflows, use a real data source as the root (Get Values in "
+            "Range from a Sheet, CSV reader, etc.). For cron-driven live "
+            "automation, leave is_listener=True (the default for Scheduler). "
+            "See create_workflow docstring for the start-node-vs-trigger "
+            "distinction."
+        )
 
     # Position: 400 px right of rightmost parent (or origin for triggers)
     if parent_node_ids:

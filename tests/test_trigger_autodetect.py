@@ -248,11 +248,18 @@ def test_attach_node_keeps_non_trigger_default_for_app_node():
 
 def test_attach_node_caller_override_wins():
     """Explicit is_trigger=False MUST stick even on a trigger-capable type.
-    Same for is_listener. The caller knows best when they pass non-None."""
+    Same for is_listener.
+
+    v0.2.21 caveat: Scheduler+is_listener=False is now REJECTED outright
+    (it was a documented footgun). To test the override-wins logic, use
+    a non-Scheduler type. We use a hypothetical type_id that maps to
+    "trigger-capable but not Scheduler" — Sheets Get Values in Range.
+    """
     from nrev_wf_mcp.server import attach_node
 
     _lookup_node_def_flags.cache_clear()
     captured: dict = {}
+    GVR_TYPE_ID = "ce01c704-f6bd-40d5-9b2b-f545495de14b"  # not Scheduler
 
     with patch("nrev_wf_mcp.server.api.get_workflow") as mock_get, \
          patch("nrev_wf_mcp.server.api.paste_nodes", side_effect=_mock_paste_capture(captured)), \
@@ -265,14 +272,14 @@ def test_attach_node_caller_override_wins():
             "blocks": [],
         }
         mock_list.return_value = _mock_catalog_page([
-            {"node_definition_id": SCHEDULER_TYPE_ID, "is_trigger": True, "isListener": True},
+            {"node_definition_id": GVR_TYPE_ID, "is_trigger": True, "isListener": False},
         ])
         result = attach_node(
             workflow_id="wf-1",
             parent_node_ids=[],
-            type_id=SCHEDULER_TYPE_ID,
-            name="Scheduler (forced non-trigger)",
-            settings={"automation-scheduler-interval": "Days"},
+            type_id=GVR_TYPE_ID,
+            name="GVR (forced non-trigger)",
+            settings={"pipedream-google_sheets-google_sheets_get_values_in_range-googleSheets_connection_id": "x"},
             is_trigger=False,
             is_listener=False,
             auto_resolve_labels=False,

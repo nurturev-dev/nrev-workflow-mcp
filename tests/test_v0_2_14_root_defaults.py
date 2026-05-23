@@ -81,39 +81,38 @@ def test_custom_code_root_with_no_parents_becomes_start_node():
     assert pasted["isListener"] is False
 
 
-def test_scheduler_root_with_explicit_is_listener_false_stays_non_listener():
-    """The 'one-off run of an otherwise-pollable type' override. A
-    Scheduler attached as a root with is_listener=False explicitly
-    should produce: isTrigger=True (still a start node), isListener=False
-    (no live polling). Useful when the user wants to manually run a
-    Scheduler-rooted workflow once without scheduling it.
+def test_scheduler_root_with_explicit_is_listener_false_REJECTED_v0_2_21():
+    """v0.2.21 changed behavior: Scheduler with is_listener=False is now
+    rejected outright. Pre-v0.2.21 the override was honored, but it produced
+    a "start node that doesn't actually fire" — a footgun the user hit in
+    the v0.2.20 session. v0.2.21 raises ValueError instead, pointing the
+    caller at the right pattern (real data source root for one-off; leave
+    is_listener=True for cron).
     """
+    import pytest
     _lookup_node_def_flags.cache_clear()
-    captured: dict = {}
 
     with patch("nrev_wf_mcp.server.api.get_workflow") as mock_get, \
-         patch("nrev_wf_mcp.server.api.paste_nodes", side_effect=_mock_paste_capture(captured)), \
-         patch("nrev_wf_mcp.server.api.put_node"), \
-         patch("nrev_wf_mcp.server.api.list_node_definitions") as mock_list, \
-         patch("nrev_wf_mcp.server._maybe_validate", return_value=None):
+         patch("nrev_wf_mcp.server.api.list_node_definitions") as mock_list:
         mock_get.return_value = {"id": "wf-1", "name": "x", "description": "", "blocks": []}
         mock_list.return_value = {"data": [{
             "node_definition_id": SCHEDULER_TYPE_ID,
             "is_trigger": True,
             "isListener": True,
         }]}
-        result = attach_node(
-            workflow_id="wf-1",
-            parent_node_ids=[],
-            type_id=SCHEDULER_TYPE_ID,
-            name="One-off Scheduler",
-            settings={"automation-scheduler-interval": "Days"},
-            is_listener=False,   # ← explicit override: don't poll
-            auto_resolve_labels=False,
-        )
-
-    assert result["is_trigger"] is True
-    assert result["is_listener"] is False, "explicit override must beat catalog auto-detect"
+        with pytest.raises(ValueError) as exc:
+            attach_node(
+                workflow_id="wf-1",
+                parent_node_ids=[],
+                type_id=SCHEDULER_TYPE_ID,
+                name="One-off Scheduler",
+                settings={"automation-scheduler-interval": "Days"},
+                is_listener=False,   # v0.2.21: footgun, now rejected
+                auto_resolve_labels=False,
+            )
+    msg = str(exc.value)
+    assert "footgun" in msg.lower() or "scheduler" in msg.lower()
+    assert "real data source" in msg.lower() or "is_listener" in msg.lower()
 
 
 def test_explicit_is_trigger_false_on_root_stays_false():

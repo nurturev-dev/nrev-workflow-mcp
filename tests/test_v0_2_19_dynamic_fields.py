@@ -141,8 +141,8 @@ def test_get_node_dynamic_fields_returns_full_schema_with_dropdown_list():
     assert "pipedream-slack_v2-slack_v2_new_message_in_channels-conversations" in result["dropdown_field_names"]
     # Boolean fields are NOT in dropdown_field_names
     assert "pipedream-slack_v2-slack_v2_new_message_in_channels-resolveNames" not in result["dropdown_field_names"]
-    # Useful hint in the response
-    assert "list_field_options" in result["note"]
+    # v0.2.21: note now points at reload_pipedream_props for dynamic fields
+    assert "reload_pipedream_props" in result["note"] or "DYNAMIC" in result["note"]
 
 
 def test_get_node_dynamic_fields_honors_explicit_field_name_changed():

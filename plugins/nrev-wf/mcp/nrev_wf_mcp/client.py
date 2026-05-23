@@ -246,6 +246,85 @@ def updated_node_config(
     return request("POST", "/nodes/updated-config-and-status", json_body=body)
 
 
+def reload_pipedream_props(
+    node_id: str,
+    node_definition_id: str,
+    field_name_changed: str,
+    settings: list[dict],
+) -> dict:
+    """POST /nodes/reload-props — Pipedream dynamic-props endpoint.
+
+    v0.2.21 discovery. This is THE endpoint that exposes Pipedream's
+    DYNAMIC fields — `col_NNNN` per sheet column (with `label` = header
+    name), `dynamic_props_id` (auto-issued in defaultValue), and array-
+    typed fields like `updation_criteria` / `fields_to_update` for
+    Update Row.
+
+    Distinct from `updated_node_config` (which wraps
+    `/nodes/updated-config-and-status`):
+      - Body shape is `{settings: [...]}` (NOT `settingFieldValues`)
+      - Response is `{componentId, errors, nodeId, fields: [...]}` (flat,
+        no `nodeDefinition` wrapper)
+      - Returns the FULL dynamic schema (e.g. 13 fields for Add Single
+        Row vs 5 from updated-config-and-status; 14 for Update Row)
+      - NOT idempotent — each call issues a fresh `dynamic_props_id`
+        token. Call ONCE per real settings change; cache the result.
+      - For Pipedream nodes WITHOUT dynamic props (e.g. Get Values in
+        Range), returns `errors: ["additionalProps not a function"]`
+        and 0 fields. Caller should treat as "no dynamic schema".
+
+    Confirmed end-to-end (validated round-trip Sheets pipeline):
+    auto-issued `dynamic_props_id` + col_NNNN.label = sheet header
+    correctly unlocks Add Single Row writes AND Update Row criteria
+    when used with the platform's required envelope shapes (see
+    docs/v0_2_21_api_investigation.md).
+
+    Args:
+        node_id:             the workflow's node UUID (must exist in a workflow;
+                             the platform validates node-existence)
+        node_definition_id:  the catalog typeId
+        field_name_changed:  the field the caller just modified (commonly
+                             `hasHeaders` to trigger column-schema reload)
+        settings:            list of {field_name, field_value} dicts —
+                             the node's CURRENT settings as the simple value
+                             pairs (NOT the full envelope shape)
+    """
+    body = {
+        "nodeId": node_id,
+        "nodeDefinitionId": node_definition_id,
+        "fieldNameChanged": field_name_changed,
+        "settings": settings,
+    }
+    return request("POST", "/nodes/reload-props", json_body=body)
+
+
+def update_workflow_and_execute(wf_id: str, node_id: str, workflow_body: dict) -> dict:
+    """POST /workflows/{wf}/nodes/{node_id}/update-workflow-and-execute —
+    atomic save-then-execute.
+
+    v0.2.21 — what the platform UI's "Run Workflow" button calls. Body
+    MUST be wrapped: `{"workflow": <full workflow envelope>}`.
+    Avoids the stale-state class of bugs we saw using separate
+    PUT-workflow + execute_node calls (the platform sometimes serves
+    a cached version mid-save).
+
+    Returns: `{workflow: <updated workflow>, execution: {response_type,
+    response: {id, status, ...}}}`. Extract execution_id from
+    `result["execution"]["response"]["id"]`.
+
+    Args:
+        wf_id:         workflow UUID
+        node_id:       the target node to execute (start of the swimlane)
+        workflow_body: the FULL workflow envelope (every block, settings,
+                       edges) — same shape as GET /workflows/{wf}
+    """
+    return request(
+        "POST",
+        f"/workflows/{wf_id}/nodes/{node_id}/update-workflow-and-execute",
+        json_body={"workflow": workflow_body},
+    )
+
+
 def list_connection_apps(
     limit: int = 50,
     offset: int = 0,

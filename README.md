@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.20** ([release notes](#release-notes)).
+Current version: **v0.2.21** ([release notes](#release-notes)).
 
 ---
 
@@ -225,6 +225,35 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.21 — Sheets CRUD validated end-to-end (READ + WRITE + UPDATE work)
+**The release where Sheets actually works.** v0.2.20 documented patterns but couldn't execute writes/updates reliably. v0.2.21 ran 9 raw-API probes + an end-to-end round-trip + an independent sub-agent verification + a UI-cURL capture to land the actual platform shapes. All three CRUD operations now validated to write real rows. See [`docs/v0_2_21_api_investigation.md`](docs/v0_2_21_api_investigation.md) — 474 lines of probe-by-probe findings.
+
+The headline discovery: **`POST /nodes/reload-props`** (NOT `updated-config-and-status`) is the Pipedream dynamic-schema endpoint. Body uses key `settings` not `settingFieldValues`. Response includes `col_NNNN` per sheet column with `label` = the header name, plus an auto-issued `dynamic_props_id` token. Without this token + col_NNNN templates, Pipedream actions silently no-op (the v0.2.19/v0.2.20 silent-failure pattern).
+
+**New tools (49 → 53)**:
+
+- **`reload_pipedream_props(workflow_id, node_id)`** — wraps `/nodes/reload-props`. Returns `{dynamic_props_id, col_to_label, array_fields, fields, has_dynamic_props}`. Cache the token — endpoint is NOT idempotent (each call issues a fresh token).
+- **`auto_map_pipedream_columns(workflow_id, node_id)`** — for an Add Single Row, auto-fills each `col_NNNN` with `{{<upstream_header>}}` template, derived from `col_NNNN.label`. Persists the `dynamic_props_id` too. One call wires up the entire Sheets write.
+- **`configure_update_row(workflow_id, node_id, criteria, updates, add_if_not_present=False)`** — pythonic helper for Update Row. Pass `criteria=[{"header": "who", "value": "ana@..."}]` and `updates=[{"header": "status", "value": "replied"}]` — the helper resolves header names to `col_NNNN` slugs via reload-props AND builds the correct list-of-lists envelope shape that the platform validator requires. The earlier "Column 'X' not found in sheet" HTTP 400 was caused by sending the wrong shape; this helper sends the right one.
+- **`save_and_execute(workflow_id, target_node_id)`** — wraps `POST /workflows/{wf}/nodes/{n}/update-workflow-and-execute`, the atomic save-then-execute endpoint the platform's "Run Workflow" button uses. Avoids the stale-state class of bugs from separate save + execute calls.
+
+**Tool changes**:
+
+- **`add_edge` also flips target `isTrigger=False`** when wiring downstream of an existing root. v0.2.20 left the workflow with two start nodes (user session: "the scheduler was still a start node not a trigger node"). Response now includes `target_isTrigger_flipped: bool`.
+- **`attach_node` rejects Scheduler with `is_listener=False`** outright. Pre-v0.2.21 this was honored, producing a "start node that doesn't actually fire" — a documented footgun the v0.2.20 session burned ~10 min on. Error message points at the right pattern (real data source root for one-off; leave is_listener=True for cron).
+- **`get_node_dynamic_fields` docstring updated** to clarify it returns only the STATIC schema (5 fields for Add Single Row). For DYNAMIC Pipedream fields (col_NNNN + dynamic_props_id + array fields), point at `reload_pipedream_props`.
+
+**Validated end-to-end** (round-trip workflow `d9807852-…` against MCP Testing sheet):
+- READ via Get Values in Range: 4 rows ingested with smart 5-column schema (post-execution inference)
+- WRITE via Add Single Row + auto-mapped templates: 4 rows appended to Sheet1, `updatedCells: 5` per row
+- UPDATE via Update Row + configure_update_row helper: 12 matching rows updated, `payload: {updated_rows_indices: [2,...,13]}`
+
+**What v0.2.21 does NOT solve (deferred)**:
+- The CC-output-schema-clobber when wired downstream of Pipedream parent — platform-side constraint we can't override via PUT. Workaround: use Sheets-read → Sheets-write directly (no CC in between).
+- Pipedream node previews via `get_node_output` return 0 rows on the `_default` handle when the action wasn't invoked — Fix F detection coming in v0.2.22.
+
+Tool count: 49 → 53. Tests: 244 → 256 (+12 in `test_v0_2_21_fixes.py` covering client wrappers + the three new MCP tools + add_edge's target-isTrigger flip + Scheduler guard).
 
 ### v0.2.20 — Pipedream silent-failure killers + Sheets CRUD documented
 **The Pipedream-quirk cleanup release.** Live end-to-end probing of v0.2.19 against Sheets revealed that Pipedream-wrapped action nodes (Add Single Row, Send Message, etc.) have a class of footguns the agent kept walking into: row-data fields that never appear in the static schema, block-level "completed/error:null" hiding row-level Pipedream errors, and update-then-write paths that couldn't add fields the schema reveals progressively. v0.2.20 ships six fixes:
