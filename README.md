@@ -1,10 +1,10 @@
 # nrev-workflow-mcp
 
-A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow API as **45 MCP tools** — build, debug, and operate workflows from inside any Claude session.
+A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow API as **48 MCP tools** — build, debug, and operate workflows from inside any Claude session.
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.14** ([release notes](#release-notes)).
+Current version: **v0.2.15** ([release notes](#release-notes)).
 
 ---
 
@@ -17,7 +17,7 @@ In any Claude Code session:
 /plugin install nrev-wf@nrev
 ```
 
-Restart Claude Code. Run `/mcp` and you should see `nrev-wf` with 45 tools.
+Restart Claude Code. Run `/mcp` and you should see `nrev-wf` with 48 tools.
 
 ### Prerequisites (one-time)
 
@@ -162,7 +162,7 @@ nrev-workflow-mcp/
 
 ---
 
-## Tools (45)
+## Tools (48)
 
 | Group | Tools |
 |---|---|
@@ -170,7 +170,7 @@ nrev-workflow-mcp/
 | **Read / inspect** | `get_workflow`, `list_workflows`, `get_node`, `get_workflow_graph`, `list_node_settings`, `get_node_neighbors`, `trace_path` |
 | **Discovery** | `list_node_definitions`, `get_node_definition`, `list_connections`, `list_connection_apps`, `list_field_options` |
 | **Validate** | `validate_workflow`, `validate_custom_code` |
-| **Build** | `create_workflow`, `attach_node`, `attach_magic_node`, `attach_python_block`, `paste_nodes`, `duplicate_workflow`, `clone_node` |
+| **Build & lifecycle** | `create_workflow`, `attach_node`, `attach_magic_node`, `attach_python_block`, `paste_nodes`, `duplicate_workflow`, `clone_node`, `publish_workflow`, `get_publish_status`, `delete_workflow` |
 | **Edit** | `update_node_setting`, `update_magic_node`, `update_ai_prompt`, `set_node_output_schema` |
 | **Wiring** | `add_edge`, `remove_edge`, `delete_node`, `splice_branch` |
 | **Sticky notes** | `list_sticky_notes`, `add_sticky_note`, `update_sticky_note`, `delete_sticky_note` |
@@ -225,6 +225,17 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.15 — workflow lifecycle + slim-view audit fields + paste_nodes hardening
+Four small wins shipped together. No behavioral changes to existing tools (except `paste_nodes` which gains a guard); all additive.
+
+- **`get_workflow` slim view surfaces more fields** — per-block `isTrigger` / `isListener` (so the agent can audit trigger flags at a glance without per-block `get_node` calls); workflow-level `status` / `liveVersion` / `playVersion` (so the agent knows whether the workflow is draft or live). Closes a gap surfaced during v0.2.14 stress-testing.
+- **New `publish_workflow(workflow_id, toggle_live=True)`** — wraps `POST /live/workflow/{id}/publish`. Promotes a draft to live (auto-fires the configured trigger). Pass `toggle_live=False` to take it off live without deleting.
+- **New `get_publish_status(workflow_id)`** — companion to `publish_workflow`. Publishes are async on the platform side; poll this to know when the live version actually serves requests.
+- **New `delete_workflow(workflow_id, confirm=True)`** — fills the obvious gap. Requires `confirm=True` to actually delete (default refuses with a clear message — guards against agents iterating). No more empty workflow shells piling up after testing.
+- **`paste_nodes` single-input guard (the 5th leak the v0.2.13 reviewer flagged)** — pre-flight refuses to paste a node spec whose `toBlocks` would create a duplicate `_default` incoming edge into any target. Exempts `df1..df5` (Magic Node fan-in). Opt-in `allow_multi_input=True` escape hatch. Closes the back door that bypassed every other v0.2.13 guard.
+
+Tool count: 45 → 48. Tests: 170 → 184.
 
 ### v0.2.14 — start-node vs trigger vocabulary fix (follow-up to v0.2.13)
 Live probing against the platform during v0.2.13 stress-tests surfaced that I'd conflated two distinct flags. The platform models them separately:

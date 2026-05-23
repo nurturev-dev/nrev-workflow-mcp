@@ -302,6 +302,42 @@ def credit_balance(tenant_id: int = 0) -> int:
     return request("GET", f"/credit-management/tenant/{int(tenant_id)}/balance")
 
 
+def publish_workflow(wf_id: str, toggle_live: bool = True) -> dict:
+    """POST /live/workflow/{wf}/publish — promote a workflow to live (or
+    take it off live by passing toggle_live=False).
+
+    Returns either a queued-request envelope (publishing is async on the
+    platform side) OR a completed publish-response, depending on whether
+    the platform short-circuits. Either shape is opaque to us; the caller
+    can poll `get_publish_status` if they want to wait.
+    """
+    return request(
+        "POST",
+        f"/live/workflow/{wf_id}/publish",
+        json_body={"toggleLive": bool(toggle_live)},
+    )
+
+
+def get_publish_status(wf_id: str) -> dict:
+    """GET /live/workflow/{wf}/publish/status — current publish state.
+
+    Useful after `publish_workflow` to know whether the live version is
+    actually serving requests yet (publishes can be queued for a few
+    seconds).
+    """
+    return request("GET", f"/live/workflow/{wf_id}/publish/status")
+
+
+def delete_workflow(wf_id: str) -> Any:
+    """DELETE /workflows/{wf} — remove the workflow entirely.
+
+    Returns whatever the platform sends back (typically empty body / null).
+    The HTTP 200 is the success signal — the wrapper raises on non-2xx via
+    WorkflowAPIError.
+    """
+    return request("DELETE", f"/workflows/{wf_id}")
+
+
 def patch_workflow_no_validation(
     wf_id: str,
     *,

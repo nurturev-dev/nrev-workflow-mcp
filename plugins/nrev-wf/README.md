@@ -1,8 +1,8 @@
 # nrev-wf — Claude Code plugin
 
-45 tools for building, debugging, and operating nRev workflows from inside Claude. Internal NurtureV tool — auth is per-user JWT (paste once per Claude session, never stored).
+48 tools for building, debugging, and operating nRev workflows from inside Claude. Internal NurtureV tool — auth is per-user JWT (paste once per Claude session, never stored).
 
-Current version: **v0.2.14** — see release notes in the [repo README](https://github.com/nurturev-dev/nrev-workflow-mcp#release-notes).
+Current version: **v0.2.15** — see release notes in the [repo README](https://github.com/nurturev-dev/nrev-workflow-mcp#release-notes).
 
 ## Install
 
@@ -13,7 +13,7 @@ In any Claude Code session:
 /plugin install nrev-wf@nrev
 ```
 
-Restart Claude Code. Run `/mcp` — you should see `nrev-wf` connected with 45 tools.
+Restart Claude Code. Run `/mcp` — you should see `nrev-wf` connected with 48 tools.
 
 ### Prerequisites (one-time)
 

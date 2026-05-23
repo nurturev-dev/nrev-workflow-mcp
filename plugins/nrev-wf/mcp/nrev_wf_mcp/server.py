@@ -148,8 +148,18 @@ def get_credit_balance() -> dict:
 def get_workflow(workflow_id: str) -> dict:
     """Slim view of a workflow's block graph.
 
-    Returns name, isRunable, workflowConfigError, and a list of blocks each with
-    {id, name, typeId, position, isTestMode, node_config_error, toBlocks, creditCostPerItem}.
+    Per-block fields: id, name, typeId, position, isTestMode, isTrigger,
+    isListener, node_config_error, toBlocks, creditCostPerItem.
+
+    Workflow-level fields: id, name, status (draft/live), liveVersion,
+    playVersion, isRunable, isTestMode, workflowConfigError, block_count.
+
+    `isTrigger` and `isListener` (v0.2.15) let you audit trigger flags at a
+    glance — useful for verifying the v0.2.13/.14 fixes worked (e.g. that a
+    downstream Gmail node is NOT marked as a listener) without calling
+    `get_node` per block. `status` / `liveVersion` show whether the workflow
+    is published or still in draft (relevant for `publish_workflow` and
+    `partial_execute` flow).
 
     Use get_node() if you need a block's full settings.
     """
@@ -162,6 +172,8 @@ def get_workflow(workflow_id: str) -> dict:
             "typeId": b.get("typeId"),
             "position": b.get("position"),
             "isTestMode": b.get("isTestMode"),
+            "isTrigger": b.get("isTrigger"),
+            "isListener": b.get("isListener"),
             "node_config_error": b.get("node_config_error"),
             "creditCostPerItem": b.get("creditCostPerItem", 0),
             "toBlocks": [
@@ -176,6 +188,9 @@ def get_workflow(workflow_id: str) -> dict:
     return {
         "id": wf.get("id"),
         "name": wf.get("name"),
+        "status": wf.get("status"),
+        "liveVersion": wf.get("liveVersion"),
+        "playVersion": wf.get("playVersion"),
         "isRunable": wf.get("isRunable"),
         "workflowConfigError": wf.get("workflowConfigError"),
         "isTestMode": wf.get("isTestMode"),
@@ -3368,14 +3383,17 @@ def attach_node(
 def paste_nodes(
     workflow_id: str,
     nodes: list[dict],
+    allow_multi_input: bool = False,
     validate_after: bool = True,
 ) -> dict:
     """Paste pre-made node specs into a workflow (mirrors the UI's drag-from-palette).
 
     For most use cases prefer `attach_node` — it's a higher-level wrapper that
-    handles edge-wiring and position defaults. Use `paste_nodes` when you need
-    the platform to auto-fill defaults from the node definition (e.g. for
-    complex AI nodes with deeply-nested settings).
+    handles edge-wiring, position defaults, AND the v0.2.13+ guards. Use
+    `paste_nodes` when you need the platform to auto-fill defaults from the
+    node definition (e.g. for complex AI nodes with deeply-nested settings),
+    or when you have a pre-built block dict from another workflow you want
+    to drop in.
 
     `nodes` is a list of partial block dicts; the platform fills in defaults
     from each node's typeId. Each entry should contain at minimum:
@@ -3384,11 +3402,79 @@ def paste_nodes(
     Optionally include "variableName", "settings_field_values" (to override
     defaults), and any other top-level block fields.
 
-    NOTE: this does NOT auto-wire edges between the pasted nodes or to existing
-    blocks. Call `add_edge` afterwards.
+    SINGLE-INPUT GUARD (v0.2.15): mirrors the guard in `add_edge` /
+    `splice_branch` / `attach_node`. If any of the pasted blocks would land
+    a second `_default` incoming edge into an already-targeted node (either
+    via a `toBlocks` entry on the pasted block itself, or by being targeted
+    by an existing block), this tool refuses with a ValueError. Skips the
+    check for `df1..df5` target handles (Magic Node fan-in). The check
+    inspects the pasted `toBlocks` AND scans the workflow's existing blocks
+    for `_default` edges into pasted block ids. Pass `allow_multi_input=True`
+    to bypass (legacy Merge / experimental use). Closes the 5th leak the
+    v0.2.13 review surfaced — `paste_nodes` was the one back door that
+    bypassed every other guard.
+
+    NOTE: this does NOT auto-wire edges between the pasted nodes or to
+    existing blocks. Call `add_edge` afterwards.
     """
     if not isinstance(nodes, list) or not nodes:
         raise ValueError("nodes must be a non-empty list of block dicts")
+
+    # ── Single-input guard ──────────────────────────────────────────────────
+    # Block the two ways paste_nodes can introduce a duplicate _default edge
+    # into a single-input target:
+    #   (a) A pasted block itself carries a `toBlocks` entry pointing to a
+    #       node (existing OR also-pasted) on _default, where that node
+    #       already has a _default incoming.
+    #   (b) The workflow already has _default edges pointing at a pasted
+    #       block id (only relevant if the caller is re-pasting a node id
+    #       that the platform never reassigns — defensive but cheap).
+    # The check is a pre-flight: if it fires, no API call is made. If it
+    # passes, the actual paste proceeds.
+    if not allow_multi_input:
+        wf = api.get_workflow(workflow_id)
+        existing_blocks = wf.get("blocks") or []
+        pasted_ids = {n.get("id") for n in nodes if n.get("id")}
+        # All edges that will exist post-paste, in the form
+        # (target_id, target_handle, source_id).
+        all_edges: list[tuple[str, str, str]] = []
+        # 1. existing → existing / pasted
+        for src in existing_blocks:
+            for e in (src.get("toBlocks") or []):
+                all_edges.append((
+                    e.get("toBlockId"),
+                    e.get("edge_target_handle_condition"),
+                    src.get("id"),
+                ))
+        # 2. pasted → anything
+        for src in nodes:
+            for e in (src.get("toBlocks") or []):
+                all_edges.append((
+                    e.get("toBlockId"),
+                    e.get("edge_target_handle_condition"),
+                    src.get("id") or "<pasted>",
+                ))
+        # Group by (target, _default handle) and refuse if any target ends
+        # up with 2+ _default incoming from distinct sources.
+        per_target: dict[str, list[str]] = {}
+        for target, handle, src in all_edges:
+            if handle != "_default":
+                continue  # Magic dfN handles + named handles exempt
+            if not target:
+                continue
+            per_target.setdefault(target, []).append(src)
+        for target, sources in per_target.items():
+            distinct = [s for s in sources if s]
+            if len(set(distinct)) >= 2:
+                raise ValueError(
+                    f"paste_nodes refuses to land multiple `_default` edges "
+                    f"into {target} (would-be sources: {sorted(set(distinct))}). "
+                    f"Multiple `_default` edges into one block silently break "
+                    f"at execution. Use df1..df5 target handles for Magic "
+                    f"Node fan-in, or remove all but one of the offending "
+                    f"`toBlocks` entries from the pasted nodes. For the legacy "
+                    f"Merge block specifically, pass allow_multi_input=True."
+                )
 
     resp = api.paste_nodes(workflow_id, {"nodes": nodes})
     return {
@@ -3421,6 +3507,94 @@ def duplicate_workflow(
         "new_workflow_id": resp.get("id"),
         "new_workflow_name": resp.get("name"),
         "version": resp.get("version"),
+    }
+
+
+@mcp.tool()
+def publish_workflow(
+    workflow_id: str,
+    toggle_live: bool = True,
+) -> dict:
+    """Publish a workflow to live mode (or take it off live).
+
+    `toggle_live=True` (default) promotes the current draft to live: the
+    workflow's `liveVersion` gets pinned and any configured trigger (cron
+    Scheduler / webhook / Gmail-poll etc.) starts firing on its own.
+    `toggle_live=False` takes the workflow off live — useful when you need
+    to stop an automated workflow without deleting it.
+
+    Required workflow state before publishing: at least one start node, a
+    valid trigger if you want it to auto-fire, and no `workflowConfigError`
+    or `node_config_error` on any block. `validate_workflow` shows you all
+    three at once. Publishes against an invalid workflow are rejected.
+
+    Returns the platform's response envelope. Publish is async — for some
+    workflows the response is "queued" and you should poll
+    `get_publish_status` for completion; for simpler workflows the response
+    already carries the live-version id.
+    """
+    resp = api.publish_workflow(workflow_id, toggle_live=toggle_live)
+    return {
+        "ok": True,
+        "workflow_id": workflow_id,
+        "toggle_live": bool(toggle_live),
+        "response": resp,
+        "note": (
+            "If the response shows a queued / pending state, call "
+            "get_publish_status(workflow_id) to poll for completion."
+        ),
+    }
+
+
+@mcp.tool()
+def get_publish_status(workflow_id: str) -> dict:
+    """Current live-publish status of a workflow.
+
+    Use after `publish_workflow` to confirm the live version is actually
+    serving requests (publishes can take a few seconds to propagate).
+
+    Returns the platform's status envelope verbatim — typically includes
+    fields like `status`, `liveVersion`, `progress`.
+    """
+    return api.get_publish_status(workflow_id)
+
+
+@mcp.tool()
+def delete_workflow(workflow_id: str, confirm: bool = False) -> dict:
+    """Permanently delete a workflow and all its blocks.
+
+    REQUIRES `confirm=True`. Without it, this tool returns a refusal
+    (without making the API call) — guards against accidental deletes
+    when the agent is iterating.
+
+    There is no undo. If you want a safety copy first, call
+    `duplicate_workflow` to fork it before deleting.
+
+    Returns `{ok, deleted_workflow_id}` on success.
+    """
+    if not confirm:
+        return {
+            "ok": False,
+            "deleted_workflow_id": None,
+            "message": (
+                f"delete_workflow refused: confirm=False (default). To "
+                f"actually delete workflow {workflow_id}, retry with "
+                f"confirm=True. There is no undo; consider "
+                f"duplicate_workflow first if you need a safety copy."
+            ),
+        }
+    try:
+        api.delete_workflow(workflow_id)
+    except Exception as e:
+        return {
+            "ok": False,
+            "deleted_workflow_id": workflow_id,
+            "error": str(e),
+        }
+    return {
+        "ok": True,
+        "deleted_workflow_id": workflow_id,
+        "message": f"Workflow {workflow_id} deleted.",
     }
 
 
