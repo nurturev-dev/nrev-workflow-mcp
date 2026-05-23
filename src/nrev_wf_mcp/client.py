@@ -130,15 +130,32 @@ def list_node_definition_categories(limit: int = 100) -> dict:
     return request("GET", "/node_definitions/categories", params={"limit": int(limit)})
 
 
-def list_connections() -> list:
-    """GET /connections — user's authorized OAuth connections.
+def list_connections(connection_app_id: Optional[str] = None) -> list:
+    """GET /connections — OAuth connections.
+
+    Two modes, depending on `connection_app_id`:
+
+      - **Unfiltered** (default): returns ONLY the JWT user's own
+        connections. For solo / single-user tenants this is sufficient.
+
+      - **Filtered by connection_app_id** (e.g. Gmail's app id): returns
+        ALL connections in the tenant for that app, including ones
+        connected by your teammates. This is what the platform's UI uses
+        when populating the connection-picker dropdown for an action node.
+        For multi-user tenants where your JWT user hasn't personally
+        OAuthed every app, this is the only way to find a viable
+        connection_id to wire into a Pipedream-action node.
 
     Returns a flat list (not wrapped in `data`/`meta`) of objects with
-    `connectionId`, `appName`, `connectionName`, `status`, etc. Needed when
-    attaching app-backed nodes (Gmail, Sheets, Calendar) — those nodes
-    require a `connectionId` in their settings.
+    `connectionId`, `appName`, `connectionName`, `status`, `createdAt`,
+    `connectionAppId`, etc.
+
+    Get the `connection_app_id` from `list_connection_apps(search="<app>")`.
     """
-    return request("GET", "/connections")
+    params: dict = {}
+    if connection_app_id:
+        params["connectionAppId"] = connection_app_id
+    return request("GET", "/connections", params=params)
 
 
 def field_options(

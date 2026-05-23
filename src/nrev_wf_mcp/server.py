@@ -1035,9 +1035,22 @@ def attach_python_block(
       5. PUTs the workflow with the new block + edge.
       6. Reads the response back to verify no node_config_error.
 
-    `code` must define `def run(...):` — the first arg is the upstream df.
+    `code` must define `def run(...)` — for single-input Custom Code, the
+    convention is `def run(df)` (just `df`, NOT `df1`). Multi-input is
+    Magic Node territory and uses `df1, df2, ..., dfN`. Stress testing in
+    v0.2.18 found that single-input CC with `def run(df1)` raises
+    `NameError: name 'df1' is not defined` at execution.
+
     `output_columns` is the list of column names this block produces.
-    `output_dtypes` is parallel to output_columns; defaults to "string" for each.
+    `output_dtypes` is parallel to output_columns; defaults to "string"
+    for each. Setting output_columns is what makes downstream blocks see
+    your new schema — without it, the platform infers from upstream and
+    your transform's column changes look invisible to the next node.
+
+    Note that `attach_python_block` requires a parent. To attach a Custom
+    Code AS A ROOT (workflow start), use `attach_node(type_id=<CC typeId>,
+    parent_node_ids=[], settings={...})` instead.
+
     Position defaults to 400 px right of parent.
     """
     issues = lint(code)
@@ -1607,7 +1620,17 @@ def add_edge(
     does NOT do this. Use `update_magic_node(...)` separately if you need to
     update references.
 
-    Returns `{ok, edge_existed, workflowConfigError}`.
+    TARGET-SIDE REFRESH (v0.2.18): if the target block is orphan
+    (`isOrphan=true`) or has empty `inputs`, this tool also PUTs the target
+    with `isOrphan=False` and an inputs skeleton. Pre-v0.2.18 add_edge only
+    PUT the source, leaving orphan targets unreachable at execution
+    ("Node is orphan"). The platform doesn't auto-recompute these fields
+    when a sibling block's `toBlocks` changes — the wrapper has to mutate
+    the target explicitly. Surfaced in the response as
+    `target_isOrphan_refreshed: true` when this fix-up ran.
+
+    Returns `{ok, edge_existed, edge_added, target_isOrphan_refreshed,
+    workflowConfigError, isRunable, validation}`.
     """
     wf = api.get_workflow(workflow_id)
     blocks_by_id = {b["id"]: b for b in wf["blocks"]}
@@ -1656,13 +1679,44 @@ def add_edge(
     src["toBlocks"] = edges
 
     # v0.2.16: per-node PUT instead of full-workflow PUT (avoids 413 on big workflows).
-    # The only mutation is the source's toBlocks; everything else in `wf` is
-    # untouched. Send just the updated source block to put_node.
-    mutation = _put_node_and_validate(workflow_id, source_node_id, src, validate_after)
+    # Send just the updated source block to put_node (defer validation until
+    # after the target-side fix below).
+    api.put_node(workflow_id, source_node_id, src)
+
+    # v0.2.18: refresh target's isOrphan + inputs ──────────────────────────
+    # Pre-fix, add_edge only PUT the source. The target's isOrphan/inputs
+    # were not touched. For the common case of wiring an existing orphan
+    # block (e.g. one created via paste_nodes with no parents), the target
+    # stayed isOrphan=True and execution failed with "Node is orphan". The
+    # platform doesn't auto-recompute isOrphan when a sibling block's
+    # toBlocks gains a new edge — we have to mutate the target ourselves.
+    tgt = blocks_by_id[target_node_id]
+    target_needs_refresh = (
+        tgt.get("isOrphan")
+        or not (tgt.get("inputs") or [])  # missing or empty inputs skeleton
+    )
+    if target_needs_refresh:
+        tgt["isOrphan"] = False
+        if not (tgt.get("inputs") or []):
+            tgt["inputs"] = [{
+                "columns": [], "columns_metadata": None, "file": "",
+                "handle_condition": "_default", "node_id": None,
+            }]
+        api.put_node(workflow_id, target_node_id, tgt)
+
+    # Final validation (single GET) after both PUTs.
+    validation = _maybe_validate(workflow_id, validate_after)
+    workflow_err = validation.get("workflowConfigError") if validation else None
+    is_runable = validation.get("isRunable") if validation else None
     return {
+        "ok": not workflow_err,
         "edge_existed": False,
         "edge_added": True,
-        **mutation,
+        "target_isOrphan_refreshed": target_needs_refresh,
+        "node_config_error": None,
+        "workflowConfigError": workflow_err,
+        "isRunable": is_runable,
+        "validation": validation,
     }
 
 
@@ -1731,7 +1785,17 @@ def delete_node(workflow_id: str, node_id: str, validate_after: bool = True) -> 
     entry — call `update_magic_node(magic_id, ...)` separately if needed, or
     `validate_workflow` to surface the dangling references.
 
-    Returns `{ok, deleted_node_name, incoming_edges_removed, outgoing_edges_removed}`.
+    v0.2.18: `ok` now reflects DELETE-OPERATION success, not workflow validity
+    post-delete. Pre-fix, deleting the only block in a workflow always
+    returned `ok:false` because the empty workflow has `workflowConfigError:
+    "Workflow has no start nodes"` — which was confusing (3 stress-test
+    agents independently misread it as a delete failure). The node IS gone;
+    that's what `ok:true` means now. `workflowConfigError` and `isRunable`
+    are still surfaced separately for callers who care about post-delete
+    workflow state.
+
+    Returns `{ok, deleted_node_id, deleted_node_name, incoming_edges_removed,
+    outgoing_edges_removed, workflowConfigError, isRunable, validation}`.
     """
     wf = api.get_workflow(workflow_id)
     target = next((b for b in wf["blocks"] if b["id"] == node_id), None)
@@ -1751,9 +1815,25 @@ def delete_node(workflow_id: str, node_id: str, validate_after: bool = True) -> 
         b["toBlocks"] = kept
 
     wf["blocks"] = new_blocks
-    resp = _put_workflow_blocks(workflow_id, wf)
+    try:
+        resp = _put_workflow_blocks(workflow_id, wf)
+    except Exception as e:
+        # The platform PUT raised — the block was NOT deleted server-side.
+        # Surface as ok:false. This is distinct from the "deleted but workflow
+        # invalid" case below.
+        return {
+            "ok": False,
+            "deleted_node_id": node_id,
+            "deleted_node_name": target.get("variableName"),
+            "incoming_edges_removed": 0,
+            "outgoing_edges_removed": 0,
+            "error": str(e),
+        }
     return {
-        "ok": not resp.get("workflowConfigError"),
+        # v0.2.18: ok = "delete API call succeeded". The node IS gone.
+        # workflowConfigError is surfaced separately — a post-delete
+        # "no start nodes" error doesn't mean the delete failed.
+        "ok": True,
         "deleted_node_id": node_id,
         "deleted_node_name": target.get("variableName"),
         "incoming_edges_removed": incoming_count,
@@ -2870,17 +2950,34 @@ def get_node_definition(type_id: str) -> dict:
 
 
 @mcp.tool()
-def list_connections() -> dict:
-    """List the user's authorized OAuth connections (Gmail, Sheets, Slack, ...).
+def list_connections(connection_app_id: Optional[str] = None) -> dict:
+    """List OAuth connections (Gmail, Sheets, Slack, Calendar, etc.).
 
-    Use the returned `connection_id` when attaching app-backed nodes — those
-    nodes typically require a `connectionId` in their settings to know which
-    of your accounts to operate on.
+    Two modes:
 
-    Returns: {count, connections: [{connection_id, app_name, connection_name,
-    status, provider, created_at}]}.
+      - **Unfiltered** (default — `connection_app_id=None`): returns ONLY
+        the JWT user's own connections. For solo / single-user tenants
+        this is sufficient. For multi-user tenants, this returns 0 if the
+        JWT user hasn't personally OAuth'd anything — even when their
+        teammates have.
+
+      - **Filtered by app** (`connection_app_id=<id>`): returns ALL
+        connections in the tenant for that app, including teammates'. This
+        is what the platform's UI uses when populating the connection
+        picker for an action node. v0.2.18 added this filter after
+        cross-user discovery was found broken via field_options (which
+        returns "No valid connection found in settings" — chicken-and-egg).
+
+    Discovery flow for a Pipedream-action node in a multi-user tenant:
+      1. `app_id = list_connection_apps(search="Gmail").apps[0].connection_app_id`
+      2. `connections = list_connections(connection_app_id=app_id).connections`
+      3. Pick one (any owner — auth is handled server-side via the
+         connection_id) and use it in your `attach_node` settings.
+
+    Returns: {count, connections: [{connection_id, app_name,
+    connection_name, status, provider, created_at, connection_app_id}]}.
     """
-    raw = api.list_connections()
+    raw = api.list_connections(connection_app_id=connection_app_id)
     items = raw if isinstance(raw, list) else (raw.get("data") if isinstance(raw, dict) else []) or []
     slim = [
         {
@@ -2895,7 +2992,7 @@ def list_connections() -> dict:
         }
         for c in items
     ]
-    return {"count": len(slim), "connections": slim}
+    return {"count": len(slim), "connections": slim, "filtered_by_app_id": connection_app_id}
 
 
 @mcp.tool()
@@ -3213,9 +3310,42 @@ def attach_node(
       The platform allows MULTIPLE start nodes (each begins its own
       swimlane) but ONLY ONE listener per workflow.
 
-    `output_columns` is optional. Most app-backed nodes don't need explicit
-    output schema (the platform fills it in from the node definition); supply
-    it only when the platform validator complains.
+    `output_columns` is optional but IMPORTANT for Custom Code blocks that
+    transform / reshape their input. Without it, the wrapper doesn't set
+    `outputs.columns_metadata` on the new block, and downstream nodes
+    continue to see UPSTREAM columns — your transform's column changes
+    are invisible. For Custom Code specifically prefer `attach_python_block`
+    which always sets the output schema. For app-backed nodes (Gmail,
+    Sheets, etc.) the platform fills in the schema from the catalog;
+    leave `output_columns=None`.
+
+    PIPEDREAM CONNECTION-FIELD NAMING (catalog quirk surfaced in v0.2.18
+    stress test): the field name is `pipedream-<value_first_segment>-
+    <action>-<trailing_segment>` where the trailing segment matches the
+    catalog `value`'s first-after-`pipedream.` token, NOT the bare app
+    name. Examples:
+      - Gmail Send Email (value `pipedream.gmail.gmail_send_email`):
+          field name `pipedream-gmail-gmail_send_email-gmail`
+      - Slack V2 Send Message (value `pipedream.slack_v2.slack_v2_send_message`):
+          field name `pipedream-slack_v2-slack_v2_send_message-slack_v2`
+                                                              ^^^^^^^^
+          Note `slack_v2` repeated — NOT bare `slack`.
+
+    CROSS-TENANT CONNECTION RUNTIME ACCEPTANCE (v0.2.18 finding): in
+    multi-user nRev tenants, the same connection_id may work at attach
+    time for one app and fail at execute time for another. Gmail and
+    Sheets accept cross-tenant connection_ids; Google Calendar's
+    Pipedream component code throws
+    `Cannot read properties of undefined (reading 'oauth_access_token')`
+    at runtime. Recommendation: in multi-user tenants, have each user
+    OAuth their own connection rather than share.
+
+    `list_node_settings` LIMITATION FOR PIPEDREAM NODES: returns only the
+    connection_id field on a freshly-attached node. The action's full
+    field list (recipient, subject, body, etc.) materializes only after
+    other settings are submitted. Don't trust `list_node_settings` as a
+    "what does this need?" preview — consult the catalog `value` slug
+    and Pipedream's documented action schema instead.
 
     `field_labels` (optional): explicit {field_name: human_label} map. Useful
     when you already know the labels (e.g. copied from another node). Values

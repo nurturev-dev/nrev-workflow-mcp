@@ -261,9 +261,20 @@ def test_set_node_output_schema_uses_per_node_put():
 
 def test_add_edge_uses_per_node_put_on_source():
     """add_edge mutates the SOURCE block's toBlocks; the per-node PUT
-    targets the source, not the downstream node."""
+    targets the source, not the downstream node.
+
+    v0.2.18: when target is non-orphan and has populated inputs, the
+    target-side refresh path is skipped — only the source is PUT.
+    """
+    # Target with non-orphan flag + populated inputs skeleton → no v0.2.18 refresh
+    target = _cc_block("tgt")
+    target["isOrphan"] = False
+    target["inputs"] = [{
+        "columns": [], "columns_metadata": None, "file": "",
+        "handle_condition": "_default", "node_id": None,
+    }]
     fake_wf = {"id": "wf-1", "name": "x", "description": "",
-               "blocks": [_cc_block("src"), _cc_block("tgt")]}
+               "blocks": [_cc_block("src"), target]}
     with patch("nrev_wf_mcp.server.api.get_workflow", return_value=fake_wf), \
          patch("nrev_wf_mcp.server.api.put_workflow") as mock_put_wf, \
          patch("nrev_wf_mcp.server.api.put_node",

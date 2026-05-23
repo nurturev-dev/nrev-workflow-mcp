@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.17** ([release notes](#release-notes)).
+Current version: **v0.2.18** ([release notes](#release-notes)).
 
 ---
 
@@ -225,6 +225,27 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.18 — Pipedream stress-test cleanup (cross-user connections + edge orphan refresh + delete_node ok-flag)
+Live Phase-2 testing against Gmail/Slack/Sheets/Calendar/Midbound/LinkedIn surfaced four bugs and several platform quirks worth documenting.
+
+- **`list_connections(connection_app_id=<id>)` enables cross-user discovery.** Pre-v0.2.18 the unfiltered call returned ONLY the JWT user's own connections — useless in multi-user nRev tenants where teammates have OAuth'd apps but you haven't. Now you can pass an `app_id` (from `list_connection_apps`) and the wrapper returns ALL tenant connections for that app — matching what the platform's UI shows in its connection picker. The unfiltered call is unchanged.
+- **`add_edge` refreshes the target's `isOrphan` + `inputs`** after wiring. Pre-v0.2.18, wiring an existing orphan block to a source updated the source's `toBlocks` but left the target as `isOrphan=True, inputs=[]` — execution then failed with `"Node is orphan"`. The wrapper now PUTs the target with `isOrphan=False` and a populated inputs skeleton when needed. Response includes `target_isOrphan_refreshed: bool` so callers can see when the second PUT fired.
+- **`delete_node` `ok` flag now reflects delete success, not workflow validity post-delete.** Pre-v0.2.18 deleting the last block always returned `ok:false` because the empty workflow has `workflowConfigError: "Workflow has no start nodes"` — three stress-test agents independently misread this as a delete failure. `ok:true` now means "the block is gone"; workflow validity is surfaced separately in the validation slice.
+
+**Docstring updates from real-world traps**:
+- `attach_python_block`: Custom Code's single-input convention is `def run(df)` (NOT `df1`). Magic Node still uses `df1..dfN`.
+- `attach_node`: `output_columns` is IMPORTANT for Custom Code transforms — without it, downstream blocks see upstream columns and your transform looks invisible. Prefer `attach_python_block` which always sets the output schema.
+- `attach_node`: documented the Pipedream connection-field naming convention (`pipedream-<value_first_segment>-<action>-<trailing_segment>` where the trailing segment matches the catalog `value`'s first-after-`pipedream.` token, not the bare app name — confused multiple test agents).
+- `attach_node`: documented the cross-tenant runtime gotcha (Gmail accepts cross-tenant connection_ids at runtime; Calendar's Pipedream component throws `oauth_access_token` errors). Recommendation: in multi-user tenants, each user OAuth their own connection.
+- `attach_node`: documented the `list_node_settings` limitation for Pipedream nodes (only shows connection_id initially; action's full field list materializes later).
+
+**Stress-test findings deferred** (not v0.2.18 scope):
+- Block-level errors don't bubble to execution-level status in `get_execution` — agents have to read `get_node_output` per block to find errors. Worth a v0.2.19 feature to auto-surface.
+- `list_node_settings` API-side fix would benefit from platform-side change.
+- LinkedIn Automation per-action credit cost lives in the description, not `startingPrice` — catalog wrapper could extract.
+
+Tool count unchanged at 48. Tests: 210 → 219 (+9 in `test_v0_2_18_cross_user_connections.py`).
 
 ### v0.2.17 — cleanup release (4 fixes + docstring corrections from v0.2.16 stress test)
 Live stress-testing v0.2.16 against 47 of 48 tools surfaced four real defects and two doc inaccuracies. All fixed.
