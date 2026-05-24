@@ -226,6 +226,34 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
 
+### v0.2.23 — three correctness bugs the GTM stress-test surfaced
+**The "less footguns, no new tools" release.** A real-world GTM workflow build (Pipedream → Magic Node → CC → Sheets Update) caught three silent-correctness bugs in the v0.2.22 build pipeline. All three now fixed with regression tests. No new tools, no API additions — just sharper edges filed down.
+
+**Fix #1 — `update_magic_node` columns_metadata had no `origin_*` keys**
+
+Magic Nodes fan multiple upstream branches into a single output dataframe. The `columns_metadata` payload powers downstream `{{data.<col>}}` autocomplete. Before v0.2.23, `update_magic_node` was writing entries with only `name`/`type` — missing `origin_node_id`, `origin_node_name`, `origin_node_type`. That broke downstream column-source attribution and caused the UI's "where did this column come from?" hover-card to render blank for any columns added/renamed via the MCP. `attach_magic_node` already used the central `_build_columns_metadata` helper that includes the origin keys — `update_magic_node` now calls the same helper. Renames carry through (`origin_node_name` reflects the new name, not the raw column).
+
+**Fix #2 — `save_and_execute` could fire on top of an in-flight execution**
+
+The platform's `update-workflow-and-execute` endpoint is fire-and-forget: it does not check whether a previous execution of the same workflow is already running. Calling `save_and_execute` twice in quick succession (common when iterating on a node's settings) would silently queue a second execution against the same workflow state, and the returned `execution_id` was no longer the one the user was watching in the UI. Worse, the second run could trample partial outputs from the first.
+
+`save_and_execute` now accepts an `if_in_flight` param with three modes:
+- `"refuse"` (default) — raises if a previous execution of this workflow is still running (`processing`/`pending`/`running` status). Response includes the in-flight `execution_id` so callers can tail or abort.
+- `"return_existing"` — returns the in-flight `execution_id` without firing a new one. Useful when re-asking "is it done yet?"
+- `"wait_and_retry"` — polls list_executions every 2s for up to 30s, then fires once the in-flight run finishes. Surfaces `waited_for_execution_id` in the response.
+
+A new internal helper `_find_in_flight_execution(workflow_id)` does the detection. It swallows API errors (returns `None`) so a flaky `list_executions` call never blocks a legitimate execute.
+
+**Fix #3 — `attach_node` left downstream blocks with empty `inputs[]` skeleton**
+
+When attaching a node WITH parents (`parent_node_ids=[...]`), the block was being built with an empty `inputs: [{"columns_metadata": [], "default_value": [{...}], "name": "_default"}]` skeleton — the same skeleton roots get. That meant the new node had no idea what columns it was receiving from its parent until the next `add_edge` call refreshed it. Downstream tools that read `block.inputs[0].columns_metadata` (validators, magic-node fan-in builders, custom-code linters) would see an empty list and incorrectly flag the node as "no upstream data".
+
+New helper `_build_inputs_from_parents(parent_node_ids, blocks_by_id)` pulls the parent's `outputs[0].columns_metadata` and copies it into the new block's `inputs[0].columns_metadata` at attach time. Roots (no parents) still get the empty skeleton — that's correct for triggers.
+
+**Tests**: 273 → 286 (+13 in `test_v0_2_23_fixes.py` covering all three fixes with edge cases: rename-carry-through, in-flight detection across all status values, error-swallowing in the polling helper, invalid `if_in_flight` mode rejection, empty-parents-list returns root skeleton, populated-parents carries metadata).
+
+Tool count: 54 → 54 (no new tools). No breaking changes — `if_in_flight` defaults to `"refuse"` which is the safer behavior; existing callers that never had in-flight collisions are unaffected.
+
 ### v0.2.22 — start-node-vs-trigger guards + `prepend_trigger` + sticky-note philosophy
 **The "if the catalog says it can't be a root, don't let it be a root" release.** Closes the silent runtime "No input data provided" failure for Custom Code / Magic Node / any action-only node attached as a workflow root. Plus a fresh helper to convert one-off workflows into scheduled automations in one call.
 

@@ -1,6 +1,6 @@
 [project]
 name = "nrev-wf-mcp"
-version = "0.2.22"
+version = "0.2.23"
 description = "Bundled nrev-wf-mcp inside the nrev-wf Cowork plugin"
 requires-python = ">=3.10"
 dependencies = [

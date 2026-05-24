@@ -65,6 +65,54 @@ def _typeid_to_value_slug(type_id: Optional[str]) -> str:
     return _TYPEID_TO_VALUE_SLUG.get(type_id, type_id)
 
 
+def _build_inputs_from_parents(parent_node_ids: list[str],
+                                blocks_by_id: dict) -> list[dict]:
+    """v0.2.23 Fix #3 — build the inputs[] skeleton for a downstream block from
+    its parents' outputs.columns_metadata.
+
+    Pre-v0.2.23, attach_node always set inputs to an empty skeleton
+    `[{columns:[], columns_metadata: None, node_id: None, ...}]`. For
+    downstream blocks (parent_node_ids non-empty), this caused workflow
+    validation to say "Fields not found in available data" until the user
+    ran remove_edge + add_edge to force the v0.2.18 refresh path.
+
+    This helper mirrors that refresh logic at attach time: for each parent,
+    pull its outputs[0].columns + columns_metadata and emit an input entry
+    pointing at the parent. Result is identical to what add_edge would
+    produce on a subsequent wiring, just baked into the initial paste-nodes
+    PUT.
+
+    Empty parent_node_ids → return the default empty skeleton (root case).
+    """
+    if not parent_node_ids:
+        # Root block — no upstream. Default empty skeleton.
+        return [{
+            "columns": [], "columns_metadata": None, "file": "",
+            "handle_condition": "_default", "node_id": None,
+        }]
+    inputs = []
+    for pid in parent_node_ids:
+        parent = blocks_by_id.get(pid)
+        if not parent:
+            # Fallback to empty skeleton for unknown parent (shouldn't happen —
+            # parent validation upstream should catch this)
+            inputs.append({
+                "columns": [], "columns_metadata": None, "file": "",
+                "handle_condition": "_default", "node_id": pid,
+            })
+            continue
+        parent_outputs = parent.get("outputs") or [{}]
+        out0 = parent_outputs[0] if parent_outputs else {}
+        inputs.append({
+            "node_id": pid,
+            "file": out0.get("file", ""),
+            "handle_condition": out0.get("handle_condition", "_default"),
+            "columns": out0.get("columns") or [],
+            "columns_metadata": out0.get("columns_metadata") or None,
+        })
+    return inputs
+
+
 def _build_columns_metadata(
     output_columns: list[str],
     output_dtypes: list[str],
@@ -2565,12 +2613,18 @@ def update_magic_node(
             output_dtypes = ["string"] * len(output_columns)
         if len(output_dtypes) != len(output_columns):
             raise ValueError("output_dtypes length must match output_columns length")
+        # v0.2.23 Fix #1 — use the canonical _build_columns_metadata helper so
+        # origin_node_id / origin_node_name / origin_node_type are populated
+        # for self-produced columns. Pre-v0.2.23 we emitted incomplete entries
+        # which the platform 422'd, blocking iterative Magic Node edits.
         target["outputs"] = [{
             "columns": output_columns,
-            "columns_metadata": [
-                {"column_name": c, "data_type": d, "is_nullable": True}
-                for c, d in zip(output_columns, output_dtypes)
-            ],
+            "columns_metadata": _build_columns_metadata(
+                output_columns, output_dtypes,
+                origin_node_id=node_id,
+                origin_node_name=target.get("variableName") or name or "",
+                origin_node_type="data_manipulation.magic_node",
+            ),
             "file": "",
             "handle_condition": "_default",
             "node_id": node_id,
@@ -3866,10 +3920,37 @@ def configure_update_row(
     }
 
 
+def _find_in_flight_execution(workflow_id: str) -> Optional[dict]:
+    """v0.2.23 helper — return the most recent in-flight execution for a workflow,
+    or None if no execution is currently running.
+
+    "In flight" = status in {'running', 'pending', 'queued'} (anything not terminal).
+    Used by save_and_execute to detect the platform's silent execution-id-reuse
+    behavior before it bites.
+
+    Best-effort: any API failure returns None (we don't want to block save_and_execute
+    on a list_executions hiccup).
+    """
+    try:
+        raw = api.list_executions(workflow_id, limit=5)
+    except Exception:
+        return None
+    items = raw.get("data") if isinstance(raw, dict) else (raw or [])
+    if not isinstance(items, list):
+        return None
+    NON_TERMINAL = {"running", "pending", "queued", "in_progress"}
+    for ex in items:
+        status = (ex.get("status") or "").lower()
+        if status in NON_TERMINAL:
+            return ex
+    return None
+
+
 @mcp.tool()
 def save_and_execute(
     workflow_id: str,
     target_node_id: str,
+    if_in_flight: str = "refuse",
 ) -> dict:
     """Atomic save-then-execute. Persists the current workflow state AND
     kicks off execution of `target_node_id` in one server-side call.
@@ -3887,13 +3968,89 @@ def save_and_execute(
     Use this after `auto_map_pipedream_columns` or `configure_update_row`
     when you want to immediately run the configured block.
 
-    Returns: {ok, execution_id, status, response}. Poll status via
-    `tail_execution(execution_id, wait_until="block_completed", target_block_id=<id>)`.
+    v0.2.23 IN-FLIGHT GUARD: if an execution for this workflow is currently
+    running, calling this endpoint AGAIN returns the SAME execution_id (the
+    platform reuses the in-flight execution slot). Callers that don't notice
+    this end up polling the stale prior run and seeing wrong results. This
+    tool now detects the in-flight case via list_executions BEFORE calling
+    update-workflow-and-execute, and behaves per `if_in_flight`:
+      - `"refuse"` (default) — return ok:False with `in_flight_execution_id`
+        so caller knows to wait
+      - `"return_existing"` — return the existing in-flight execution_id
+        with `was_in_flight: True` so caller can poll the existing run
+      - `"wait_and_retry"` — poll until the in-flight run completes (up to
+        300s) then start the new one. Use sparingly — blocks for a long time.
+
+    Returns: {ok, execution_id, status, was_in_flight, in_flight_execution_id,
+    response, note}.
     """
+    if if_in_flight not in ("refuse", "return_existing", "wait_and_retry"):
+        raise ValueError(
+            f"if_in_flight must be one of: refuse, return_existing, "
+            f"wait_and_retry. Got: {if_in_flight!r}"
+        )
     wf = api.get_workflow(workflow_id)
     target = next((b for b in wf["blocks"] if b["id"] == target_node_id), None)
     if target is None:
         raise ValueError(f"target_node_id {target_node_id} not in workflow {workflow_id}")
+
+    # v0.2.23 Fix #2 — check for in-flight execution before firing.
+    # The platform's update-workflow-and-execute endpoint silently returns
+    # the existing execution_id when one is already running for this
+    # workflow, leading to stale-snapshot polling. Detect and surface.
+    in_flight_exec = _find_in_flight_execution(workflow_id)
+    if in_flight_exec:
+        if if_in_flight == "refuse":
+            return {
+                "ok": False,
+                "stage": "in_flight_guard",
+                "in_flight_execution_id": in_flight_exec.get("id"),
+                "in_flight_status": in_flight_exec.get("status"),
+                "message": (
+                    f"Workflow already has an execution in flight "
+                    f"(id={in_flight_exec.get('id')!r}, "
+                    f"status={in_flight_exec.get('status')!r}). The platform's "
+                    f"update-workflow-and-execute endpoint would silently reuse "
+                    f"that execution slot, causing stale-snapshot bugs. Wait "
+                    f"for it to complete (poll via tail_execution) OR pass "
+                    f"if_in_flight='return_existing' to receive the in-flight "
+                    f"id explicitly OR if_in_flight='wait_and_retry' to block "
+                    f"until it finishes then start a new run."
+                ),
+            }
+        if if_in_flight == "return_existing":
+            return {
+                "ok": True,
+                "execution_id": in_flight_exec.get("id"),
+                "status": in_flight_exec.get("status"),
+                "was_in_flight": True,
+                "in_flight_execution_id": in_flight_exec.get("id"),
+                "note": (
+                    "Returned the EXISTING in-flight execution_id (per "
+                    "if_in_flight='return_existing'). No new execution was "
+                    "started. Settings changes you made since the in-flight "
+                    "execution started are NOT reflected in this run."
+                ),
+            }
+        # wait_and_retry: poll until done, then fire fresh
+        import time
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            time.sleep(5)
+            in_flight_exec = _find_in_flight_execution(workflow_id)
+            if not in_flight_exec:
+                break
+        if in_flight_exec:
+            return {
+                "ok": False,
+                "stage": "in_flight_guard",
+                "in_flight_execution_id": in_flight_exec.get("id"),
+                "message": (
+                    f"Waited 300s for in-flight execution "
+                    f"{in_flight_exec.get('id')!r} to complete; it's still "
+                    f"running. Caller should poll or abort manually."
+                ),
+            }
 
     try:
         resp = api.update_workflow_and_execute(workflow_id, target_node_id, wf)
@@ -3906,6 +4063,7 @@ def save_and_execute(
         "execution_id": execution.get("id"),
         "status": execution.get("status"),
         "started_at": execution.get("startedAt"),
+        "was_in_flight": False,  # v0.2.23 — caller can rely on this to know it's a fresh run
         "note": (
             "Poll with tail_execution(execution_id, wait_until='block_completed', "
             f"target_block_id='{target_node_id}'). For Pipedream nodes, also "
@@ -4556,10 +4714,12 @@ def attach_node(
         "isPartOfActiveSwimlane": True,
         "isListener": resolved_is_listener,
         "isTestMode": False,
-        "inputs": [{
-            "columns": [], "columns_metadata": None, "file": "",
-            "handle_condition": "_default", "node_id": None,
-        }],
+        # v0.2.23 Fix #3 — populate inputs from parent's outputs.columns_metadata
+        # so downstream validation doesn't say "Fields not found in available
+        # data" on first attach. Pre-v0.2.23 the inputs were always an empty
+        # skeleton, and the only way to recover was remove_edge + add_edge.
+        # This mirrors the v0.2.18 add_edge refresh logic.
+        "inputs": _build_inputs_from_parents(parent_node_ids, blocks_by_id),
         "outputs": outputs,
         "toBlocks": [],
         "position": {"x": float(position_x), "y": float(position_y)},
