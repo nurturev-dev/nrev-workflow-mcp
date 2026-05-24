@@ -1798,7 +1798,20 @@ def add_edge(
     `target_isOrphan_refreshed: true` when this fix-up ran.
 
     Returns `{ok, edge_existed, edge_added, target_isOrphan_refreshed,
-    workflowConfigError, isRunable, validation}`.
+    target_isTrigger_flipped, workflowConfigError, isRunable, validation}`.
+
+    START-NODE-vs-TRIGGER quick reference (see create_workflow docstring for
+    the full story):
+      `isTrigger=True` marks a block as a workflow START NODE. A workflow needs
+      at least one. Multiple are allowed (each begins its own swimlane).
+      `isListener=True` marks the SINGLE block that polls/subscribes to events
+      (Scheduler, "New X" types). Max one per workflow (platform-enforced).
+      When `add_edge` wires INTO an existing start node, this tool auto-flips
+      target.isTrigger=False (v0.2.21 fix) so the workflow doesn't end up with
+      multiple roots when only one was intended. To CONVERT a one-off workflow
+      into a triggered automation, use `prepend_trigger` (v0.2.22) — it's the
+      attach-then-add_edge sequence wrapped in one tool with a built-in
+      explanation of the runtime behavior gotcha.
     """
     wf = api.get_workflow(workflow_id)
     blocks_by_id = {b["id"]: b for b in wf["blocks"]}
@@ -3121,6 +3134,9 @@ def list_node_definitions(
     offset: int = 0,
     search: Optional[str] = None,
     category: Optional[str] = None,
+    only_trigger: bool = False,
+    only_action: bool = False,
+    only_listener: bool = False,
 ) -> dict:
     """Catalog of every node type the platform supports.
 
@@ -3131,12 +3147,30 @@ def list_node_definitions(
     Use search to filter by name ("Gmail", "Scheduler", "Magic Node").
     Use category to scope to one section (e.g. "Data Manipulation", "Gmail").
 
-    Combined search+category narrows further.
+    v0.2.22 filters:
+      - `only_trigger=True`: nodes that CAN be workflow start nodes (catalog
+        `is_trigger=True`). Includes both true listeners (Scheduler, "New X"
+        events) AND one-shot start nodes (Get Values in Range, Search People).
+        Use this to discover viable root candidates.
+      - `only_action=True`: the inverse — action-only nodes that REQUIRE a
+        parent. Includes Custom Code, all transformations, all Send/Add/Update
+        operations. Attaching these as a root via attach_node will be refused
+        (v0.2.22 guard).
+      - `only_listener=True`: client-side filter to the TRUE automation
+        triggers (catalog `is_listener=True` — Scheduler, all the "New X" /
+        "(Instant)" events). Subset of only_trigger.
+
+    Combined search/category/filter args narrow further.
     """
-    raw = api.list_node_definitions(limit=limit, offset=offset,
-                                     search=search, category=category)
+    raw = api.list_node_definitions(
+        limit=limit, offset=offset, search=search, category=category,
+        only_trigger=only_trigger, only_action=only_action,
+    )
     items = raw.get("data", []) if isinstance(raw, dict) else []
     meta = (raw.get("meta") or {}) if isinstance(raw, dict) else {}
+    # Client-side filter for only_listener (platform doesn't expose this)
+    if only_listener:
+        items = [n for n in items if n.get("isListener")]
     slim = [
         {
             "type_id": n.get("node_definition_id"),
@@ -3157,6 +3191,9 @@ def list_node_definitions(
         "offset": meta.get("skip", offset),
         "search": search,
         "category": category,
+        "only_trigger": only_trigger,
+        "only_action": only_action,
+        "only_listener": only_listener,
         "node_definitions": slim,
     }
 
@@ -4144,6 +4181,8 @@ def attach_node(
     auto_resolve_labels: bool = True,
     allow_multi_input: bool = False,
     validate_after: bool = True,
+    force_root: bool = False,
+    force_demote_listener: bool = False,
 ) -> dict:
     """Generic block-attach for ANY node type (Scheduler, Gmail, Calendar, AI, etc.).
 
@@ -4189,6 +4228,20 @@ def attach_node(
 
       The platform allows MULTIPLE start nodes (each begins its own
       swimlane) but ONLY ONE listener per workflow.
+
+    v0.2.22 GUARDS:
+      - `force_root` (default False): if catalog `is_trigger=False` for the
+        typeId AND parent_node_ids=[], attach is REFUSED (raises ValueError).
+        Custom Code, Magic Node, and all action-only nodes have
+        `is_trigger=False` in the catalog and require a parent. Pass
+        force_root=True to bypass for a catalog edge case (rare).
+      - `force_demote_listener` (default False): if attaching a listener-
+        capable node as a root AND the workflow already has a block with
+        isListener=True, the attach is REFUSED. The platform enforces
+        max-one-listener-per-workflow. Pass force_demote_listener=True to
+        auto-flip is_listener=False on the new block (response surfaces
+        `demoted_from_listener: True`). Or pass is_listener=False
+        explicitly with the same effect. Used internally by `prepend_trigger`.
 
     `output_columns` is optional but IMPORTANT for Custom Code blocks that
     transform / reshape their input. Without it, the wrapper doesn't set
@@ -4351,9 +4404,57 @@ def attach_node(
     # Explicit overrides always win. Pass is_listener=False on a
     # Scheduler/listener-capable root if you want a one-off run of an
     # otherwise-pollable type.
+    auto_trigger: Optional[bool] = None
     auto_listener: Optional[bool] = None
-    if not parent_node_ids and is_listener is None:
-        _, auto_listener = _lookup_node_def_flags(type_id)
+    if not parent_node_ids:
+        auto_trigger, auto_listener = _lookup_node_def_flags(type_id)
+
+    # v0.2.22 Fix #1 — refuse non-trigger-capable types as root.
+    # Catalog `is_trigger=False` means the node REQUIRES a parent — it's an
+    # action / transformation that can't be a workflow start node. Attempting
+    # this used to fail silently at runtime with "No input data provided" (e.g.
+    # Custom Code as root). Now blocked upfront with a clear pointer.
+    if not parent_node_ids and auto_trigger is False and not force_root:
+        raise ValueError(
+            f"Node typeId {type_id!r} (name={name!r}) cannot be a workflow start "
+            f"node — the catalog marks it `is_trigger=False`, meaning it's an "
+            f"action that requires a parent. Attach a real data source as the "
+            f"root (Get Values in Range, CSV Upload, Search People, etc.) and "
+            f"wire this block downstream. If you genuinely need to override "
+            f"this for a catalog edge case, pass force_root=True."
+        )
+
+    # v0.2.22 Fix #2 — one-listener-per-workflow guard.
+    # The platform allows at most ONE block with isListener=True per workflow
+    # (the "automation trigger"). Attaching a 2nd listener-capable node as a
+    # root would normally auto-set isListener=True via the catalog, creating
+    # an invalid workflow. Detect and refuse with a clear path forward.
+    # NOTE: only fires when isListener WOULD be True (catalog says listener-
+    # capable AND caller didn't explicitly set is_listener=False).
+    workflow_already_has_listener = next(
+        (b for b in wf["blocks"] if b.get("isListener")), None
+    )
+    would_be_listener = (
+        not parent_node_ids
+        and is_listener is not False
+        and (is_listener is True or auto_listener)
+    )
+    demoted_from_listener = False
+    if workflow_already_has_listener and would_be_listener and not force_demote_listener:
+        existing_name = (workflow_already_has_listener.get("variableName")
+                         or workflow_already_has_listener["id"])
+        raise ValueError(
+            f"Workflow already has a listener: {existing_name!r}. Only ONE "
+            f"listener (automation trigger) per workflow is allowed by the "
+            f"platform. To attach this as a NON-listener start node instead, "
+            f"pass either force_demote_listener=True (auto-flips to "
+            f"is_listener=False) or is_listener=False explicitly."
+        )
+    if workflow_already_has_listener and would_be_listener and force_demote_listener:
+        # Auto-demote: silently flip is_listener to False
+        is_listener = False
+        demoted_from_listener = True
+
     if parent_node_ids:
         resolved_is_trigger = is_trigger if is_trigger is not None else False
         resolved_is_listener = is_listener if is_listener is not None else False
@@ -4368,8 +4469,12 @@ def attach_node(
     # almost certainly trying to do a one-off test run — point them at the
     # right pattern (real data source as root, OR Scheduler+leave-listener-on
     # for cron). v0.2.20 session burned ~10 min of debugging on this.
+    # v0.2.22: skip this guard if Scheduler was auto-demoted by Fix #2
+    # (force_demote_listener=True with an existing listener). In that case the
+    # caller explicitly opted into the demotion via prepend_trigger or similar.
     SCHEDULER_TYPEID = "68da2fb4-8295-4568-9415-c47de58e6224"
-    if type_id == SCHEDULER_TYPEID and is_listener is False:
+    if (type_id == SCHEDULER_TYPEID and is_listener is False
+            and not demoted_from_listener):
         raise ValueError(
             "Scheduler with is_listener=False is a footgun — it becomes a "
             "start node that doesn't actually fire. For one-off / ad-hoc "
@@ -4521,10 +4626,143 @@ def attach_node(
         "isRunable": resp.get("isRunable"),
         "is_trigger": resolved_is_trigger,   # final value applied to the block
         "is_listener": resolved_is_listener,  # final value applied to the block
+        "demoted_from_listener": demoted_from_listener,  # v0.2.22
         "resolved_labels": resolved_labels,  # which dropdown fields got auto-resolved
         "explicit_labels": list(field_labels.keys()),  # which were caller-supplied
         "pipedream_field_warnings": pipedream_field_warnings,  # v0.2.20
         "validation": _maybe_validate(workflow_id, validate_after),
+    }
+
+
+@mcp.tool()
+def prepend_trigger(
+    workflow_id: str,
+    existing_root_id: str,
+    trigger_type_id: str,
+    trigger_settings: dict,
+    trigger_name: str = "Trigger",
+    is_listener: Optional[bool] = None,
+    validate_after: bool = True,
+) -> dict:
+    """Prepend a trigger node (typically Scheduler) before an existing root.
+
+    v0.2.22 — convenience tool for the common "I want to convert this one-off
+    workflow into a scheduled/triggered automation" pattern.
+
+    Under the hood (two server-side steps, atomic from caller's view):
+      1. attach_node(parent_node_ids=[], type_id=trigger_type_id, ...) —
+         adds the trigger as a new root. If trigger_type_id is listener-
+         capable (e.g. Scheduler), auto-set isListener=True.
+      2. add_edge(new_trigger → existing_root_id) — wires the trigger to
+         fire the existing root on each invocation. The v0.2.21 add_edge
+         auto-flips the existing root's isTrigger=False so the workflow
+         ends up with exactly ONE start node (the new trigger).
+
+    GOTCHA — runtime behavior of the downstream action:
+      The existing root's SETTINGS are NOT overridden by trigger output.
+      Pipedream-flavored actions (Find Email, Search People, Get Values
+      in Range, etc.) will use their OWN configured query/parameters each
+      time the trigger fires. The trigger's output (e.g. Scheduler's
+      `data.timestamp`) is available to the downstream node BUT only if
+      the action's settings explicitly reference upstream columns via
+      `{{data.timestamp}}` or similar Jinja-like templates.
+      Verified live in v0.2.22 probe: Find Email with `q="from:..."` ran
+      identically standalone vs prepended-with-Scheduler — the action's
+      own settings drive what it does; the trigger just provides cadence.
+
+    Args:
+      workflow_id:        target workflow id
+      existing_root_id:   the current root you want to prepend a trigger to.
+                          Must currently be a root (no incoming edges).
+      trigger_type_id:    typeId of the trigger (most commonly Scheduler's
+                          typeId `68da2fb4-8295-4568-9415-c47de58e6224`)
+      trigger_settings:   settings dict for the trigger (e.g. for Scheduler,
+                          `{"automation-scheduler-interval": "Days"}`)
+      trigger_name:       display name for the new trigger block
+      is_listener:        auto-detected from catalog when None. For
+                          Scheduler-like types this resolves to True. Pass
+                          False explicitly to attach the trigger as a
+                          non-listener start node (rare).
+      validate_after:     whether to run validate_workflow after wiring.
+
+    Returns: {ok, trigger_node_id, trigger_is_listener,
+    target_isTrigger_flipped, target_isOrphan_refreshed, workflow_is_runable,
+    note, validation}.
+    """
+    wf = api.get_workflow(workflow_id)
+    target = next((b for b in wf["blocks"] if b["id"] == existing_root_id), None)
+    if target is None:
+        raise ValueError(f"existing_root_id {existing_root_id} not in workflow {workflow_id}")
+    # Verify target IS currently a root (no incoming edges)
+    has_incoming = any(
+        any(t.get("toBlockId") == existing_root_id for t in (b.get("toBlocks") or []))
+        for b in wf["blocks"] if b["id"] != existing_root_id
+    )
+    if has_incoming:
+        return {
+            "ok": False,
+            "message": (
+                f"existing_root_id {existing_root_id} already has incoming "
+                f"edges — it's not currently a root. Use add_edge directly if "
+                f"you want to add another upstream connection."
+            ),
+        }
+
+    # Position the trigger 400px to the left of the existing root
+    target_pos = target.get("position", {"x": 0, "y": 0}) or {}
+    trigger_x = float(target_pos.get("x", 0)) - 400
+    trigger_y = float(target_pos.get("y", 0))
+
+    # Step 1: attach the trigger as a new root.
+    # Use force_demote_listener=True so we don't fail if there's already a
+    # listener — the prepend pattern intentionally demotes existing roots.
+    attach_result = attach_node(
+        workflow_id=workflow_id,
+        parent_node_ids=[],
+        type_id=trigger_type_id,
+        name=trigger_name,
+        settings=trigger_settings,
+        is_listener=is_listener,
+        position_x=trigger_x,
+        position_y=trigger_y,
+        validate_after=False,
+        force_demote_listener=True,
+    )
+    if not attach_result.get("ok"):
+        return {
+            "ok": False,
+            "stage": "attach_trigger",
+            "message": "trigger attach failed",
+            "details": attach_result,
+        }
+    trigger_id = attach_result["node_id"]
+
+    # Step 2: wire trigger → existing root. The v0.2.21 add_edge auto-flips
+    # target.isTrigger=False since the target now has a parent.
+    edge_result = add_edge(
+        workflow_id=workflow_id,
+        source_node_id=trigger_id,
+        target_node_id=existing_root_id,
+        validate_after=validate_after,
+    )
+
+    target_name = target.get("variableName") or existing_root_id
+    return {
+        "ok": edge_result.get("ok", False),
+        "trigger_node_id": trigger_id,
+        "trigger_is_listener": attach_result.get("is_listener"),
+        "trigger_demoted_from_listener": attach_result.get("demoted_from_listener", False),
+        "target_isTrigger_flipped": edge_result.get("target_isTrigger_flipped", False),
+        "target_isOrphan_refreshed": edge_result.get("target_isOrphan_refreshed", False),
+        "workflow_is_runable": edge_result.get("isRunable"),
+        "validation": edge_result.get("validation"),
+        "note": (
+            f"Trigger wired. The downstream node {target_name!r} will use its "
+            f"OWN configured settings each time the trigger fires. To template "
+            f"values from the trigger (e.g. Scheduler.data.timestamp) into the "
+            f"action, manually edit the downstream node's settings to reference "
+            f"upstream columns via {{{{ data.<field> }}}} templates."
+        ),
     }
 
 
@@ -4877,9 +5115,15 @@ def add_sticky_note(
     """Add a sticky note to a workflow. `text` is plain text; newlines become
     separate paragraphs in the rendered note.
 
-    Use this for documentation: explain what a swimlane does, mark a node as
-    "needs review", call out a known limitation. The note lives on the
-    workflow canvas, not on any specific node.
+    WHEN TO USE STICKY NOTES — planning aid, not decoration.
+    Treat sticky notes like comments in code: write them when the workflow
+    graph alone doesn't carry the WHY. Good uses: intent of a swimlane,
+    non-obvious decisions ("using ASR not AMR because…"), open TODOs,
+    known limitations, a one-line summary of a complex branch. Avoid:
+    restating what the block names already say, decorative section
+    headers, one note per block. If the workflow needs a sticky note to
+    be understandable at all, the workflow itself probably needs renaming
+    or restructuring first.
 
     `color` is a hex code (e.g. "#FFEB3B" yellow, "#80DEEA" cyan,
     "#F8BBD0" pink). `color_mode` is one of: background, transparent, border.
@@ -4936,6 +5180,16 @@ def update_sticky_note(
 ) -> dict:
     """Update fields on an existing sticky note. Only fields you pass are
     changed; everything else stays as-is.
+
+    WHEN TO USE STICKY NOTES — planning aid, not decoration.
+    Treat sticky notes like comments in code: write them when the workflow
+    graph alone doesn't carry the WHY. Good uses: intent of a swimlane,
+    non-obvious decisions ("using ASR not AMR because…"), open TODOs,
+    known limitations, a one-line summary of a complex branch. Avoid:
+    restating what the block names already say, decorative section
+    headers, one note per block. If the workflow needs a sticky note to
+    be understandable at all, the workflow itself probably needs renaming
+    or restructuring first.
 
     Use `list_sticky_notes(workflow_id)` first to find the note_id.
     """

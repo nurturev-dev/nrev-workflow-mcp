@@ -4,7 +4,7 @@ A Claude Code marketplace + plugin from NurtureV that exposes the nRev workflow 
 
 Internal tool. Auth is JWT-only, per-user, never stored.
 
-Current version: **v0.2.21** ([release notes](#release-notes)).
+Current version: **v0.2.22** ([release notes](#release-notes)).
 
 ---
 
@@ -225,6 +225,36 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.22 — start-node-vs-trigger guards + `prepend_trigger` + sticky-note philosophy
+**The "if the catalog says it can't be a root, don't let it be a root" release.** Closes the silent runtime "No input data provided" failure for Custom Code / Magic Node / any action-only node attached as a workflow root. Plus a fresh helper to convert one-off workflows into scheduled automations in one call.
+
+**Two new attach_node guards**:
+
+- **Refuse non-trigger-capable as root** — if the node-def catalog marks `is_trigger=False` for the typeId AND `parent_node_ids=[]`, attach now raises with a clear pointer at real data sources (Get Values in Range, CSV Upload, Search People, etc.). Escape hatch: `force_root=True` for catalog edge cases.
+- **One-listener-per-workflow** — if you try to attach a listener-capable node as a 2nd root in a workflow that already has a block with `isListener=True`, attach raises (the platform enforces max-one-listener-per-workflow). Escape hatches: `force_demote_listener=True` (auto-flips the new block to `is_listener=False`, response surfaces `demoted_from_listener: True`) or pass `is_listener=False` explicitly.
+
+**New tool — `prepend_trigger`**:
+
+`prepend_trigger(workflow_id, existing_root_id, trigger_type_id, trigger_settings, trigger_name="Trigger")` — the common "convert this one-off workflow into a scheduled automation" pattern in one call. Two steps under the hood: attach the trigger as a new root → `add_edge(trigger → existing_root)`. The v0.2.21 `add_edge` fix automatically flips the existing root's `isTrigger=False` so the workflow ends up with exactly ONE start node. Uses `force_demote_listener=True` internally so it works even if the existing root is itself a listener.
+
+**Live-validated** in v0.2.22 prep: Gmail Find Email (Pipedream trigger-flavored start-only node) ran identically standalone vs prepended-with-Scheduler — the action's own settings drive what it does; the trigger just provides cadence. The tool's response includes a note explaining this: *"The downstream node will use its OWN configured settings each time the trigger fires. To template values from the trigger into the action, manually edit the action's settings to reference `{{data.<field>}}`."*
+
+**`list_node_definitions` filter params**:
+
+- `only_trigger=True` — filter to nodes that CAN be workflow roots (catalog `is_trigger=True`). Includes both true listeners AND one-shot start nodes. ~157 of 464.
+- `only_action=True` — the inverse — action-only nodes that REQUIRE a parent. ~307 of 464.
+- `only_listener=True` — client-side filter to the TRUE automation triggers (`isListener=True`). Subset of `only_trigger`. ~127 of 464.
+
+The platform's `onlyTrigger=true` / `onlyAction=true` query params are now plumbed through; `only_listener` is a client-side filter on top.
+
+**Sticky-note docstring guidance** (`add_sticky_note` + `update_sticky_note`):
+
+Per user direction — sticky notes are a planning aid, not decoration. Treat them like comments in code: good for intent of a swimlane, non-obvious decisions, TODOs, known limitations. Avoid restating block names, decorative section headers, one-per-block. The exact text is now baked into both tool docstrings.
+
+**`add_edge` docstring** — pulls the start-node-vs-trigger semantics out of `create_workflow` and into `add_edge` (where callers actually look first when wiring), and points at `prepend_trigger` for the common conversion case.
+
+Tool count: 53 → 54 (added `prepend_trigger`). Tests: 256 → 273 (+17 in `test_v0_2_22_fixes.py`).
 
 ### v0.2.21 — Sheets CRUD validated end-to-end (READ + WRITE + UPDATE work)
 **The release where Sheets actually works.** v0.2.20 documented patterns but couldn't execute writes/updates reliably. v0.2.21 ran 9 raw-API probes + an end-to-end round-trip + an independent sub-agent verification + a UI-cURL capture to land the actual platform shapes. All three CRUD operations now validated to write real rows. See [`docs/v0_2_21_api_investigation.md`](docs/v0_2_21_api_investigation.md) — 474 lines of probe-by-probe findings.

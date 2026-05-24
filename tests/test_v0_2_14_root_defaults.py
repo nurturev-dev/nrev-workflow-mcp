@@ -39,17 +39,13 @@ def _mock_paste_capture(captured: dict):
 
 
 def test_custom_code_root_with_no_parents_becomes_start_node():
-    """Headline v0.2.14 fix. A plain Custom Code attached as a workflow
-    root MUST become a start node (isTrigger=True), even though the
-    catalog says is_trigger=false. Otherwise the workflow would fail
-    with 'no start nodes' on every save.
+    """v0.2.14 root-defaults behavior with v0.2.22 guard awareness.
 
-    isListener stays False because Custom Code isn't listener-capable
-    in the catalog.
-
-    Pre-v0.2.14: both flags False (caller had to remember to mark the
-    root as a start). Now: isTrigger=True, isListener=False — the agent
-    can build a one-off Custom Code workflow without ceremony.
+    v0.2.22 added Fix #1: refuse non-trigger-capable types (catalog
+    is_trigger=False) as roots since they fail at runtime with "No input
+    data provided". To preserve the original test (which validated the
+    flag defaulting itself), pass force_root=True to bypass the guard.
+    The defaulting logic still does its job: isTrigger=True, isListener=False.
     """
     _lookup_node_def_flags.cache_clear()
     captured: dict = {}
@@ -72,6 +68,7 @@ def test_custom_code_root_with_no_parents_becomes_start_node():
             name="CC root",
             settings={"data_manipulation-custom_code-code": "def run(df1):\n    return df1\n"},
             auto_resolve_labels=False,
+            force_root=True,  # v0.2.22 — bypass non-trigger guard
         )
 
     assert result["is_trigger"] is True, "every parent-empty root must be a start node"
@@ -142,6 +139,7 @@ def test_explicit_is_trigger_false_on_root_stays_false():
             settings={"data_manipulation-custom_code-code": "def run(df1):\n    return df1\n"},
             is_trigger=False,   # ← explicit override
             auto_resolve_labels=False,
+            force_root=True,  # v0.2.22 — bypass non-trigger guard for this scenario
         )
 
     assert result["is_trigger"] is False
@@ -188,6 +186,7 @@ def test_multiple_start_node_roots_can_be_created():
             name="Second Start",
             settings={"data_manipulation-custom_code-code": "def run(df1):\n    return df1\n"},
             auto_resolve_labels=False,
+            force_root=True,  # v0.2.22 — bypass non-trigger guard
         )
 
     assert result["is_trigger"] is True, "wrapper must allow multiple start nodes"

@@ -106,10 +106,17 @@ def list_node_definitions(
     offset: int = 0,
     search: Optional[str] = None,
     category: Optional[str] = None,
+    only_trigger: bool = False,
+    only_action: bool = False,
 ) -> dict:
     """GET /node_definitions — paginated catalog of all node types.
 
     `limit` is clamped to 100 (platform returns 422 above).
+
+    v0.2.22: `only_trigger=True` filters to trigger-capable nodes (catalog
+    `is_trigger=True` — can be attached as a workflow root). `only_action=True`
+    is the inverse (action-only nodes that need a parent). These map to the
+    platform's `onlyTrigger` / `onlyAction` query params.
 
     Returns {data: [{node_definition_id, value, name, category, description,
     is_trigger, ...}], meta}. The `node_definition_id` IS the typeId used in
@@ -120,6 +127,10 @@ def list_node_definitions(
         params["search"] = search
     if category:
         params["category"] = category
+    if only_trigger:
+        params["onlyTrigger"] = "true"
+    if only_action:
+        params["onlyAction"] = "true"
     return request("GET", "/node_definitions", params=params)
 
 
