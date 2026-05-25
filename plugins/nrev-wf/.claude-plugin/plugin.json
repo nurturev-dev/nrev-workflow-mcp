@@ -1,7 +1,7 @@
 {
   "name": "nrev-wf",
-  "version": "0.2.25",
-  "description": "Build, debug, and operate nRev workflows from Claude — 54 tools wrapping the nRev workflow API. Auth via per-user JWT, no secrets bundled.",
+  "version": "0.2.26",
+  "description": "Build, debug, and operate nRev workflows + nRev tables from Claude — 75 tools (55 workflow + 19 tables + get_plugin_version). Auth via per-user JWT, no secrets bundled.",
   "author": {
     "name": "NurtureV"
   },

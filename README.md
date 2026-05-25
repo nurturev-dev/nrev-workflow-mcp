@@ -226,6 +226,53 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
 
+### v0.2.26 — nRev Tables integration (19 new tools + version helper)
+**The "tables ships" release.** nRev Tables landed on prod 2026-05-25; this release wraps the full 15-endpoint surface in 19 ergonomic MCP tools.
+
+**What's in**
+
+| Group | Tools |
+|---|---|
+| Tables | `tables_list`, `tables_list_creators`, `tables_get`, `tables_create`, `tables_rename`, `tables_delete` |
+| Columns | `tables_add_column`, `tables_rename_column`, `tables_reorder_column`, `tables_delete_column` |
+| Rows | `tables_list_rows`, `tables_fetch_all_rows`, `tables_add_row`, `tables_update_row`, `tables_delete_row`, `tables_bulk_add_rows` |
+| Misc | `get_plugin_version` |
+
+**Same JWT** as the workflow tools — no separate auth step. `set_jwt(jwt)` once, both services work.
+
+**Name ↔ id translation, built in**
+
+The platform stores rows keyed by COLUMN UUID, not column name. That's a UX trap. The MCP tools auto-translate names ↔ UUIDs on the way in AND out:
+
+- `tables_add_row(table_id, {"name": "Alice", "score": 99})` — pass names, MCP resolves to UUIDs
+- `tables_list_rows(table_id)` — response rows come back name-keyed
+- `tables_list_rows(table_id, columns=["name", "score"])` — only those columns, name-keyed
+- `tables_list_rows(table_id, filter={"column": "score", "operator": "gt", "value": 50})` — filter column accepts a name
+
+Advanced: pass `by_column_id=True` to opt out of translation when you already have UUIDs.
+
+**`fetch_all_rows` handles pagination**
+
+`list_rows` is capped at the platform-required `limit` enum: 100/500/1000/5000/10000/50000/100000. `fetch_all_rows(table_id, max_rows=10000)` auto-paginates in 1000-row chunks until exhausted or capped. Default cap 10k to prevent runaway.
+
+**`bulk_add_rows` for small batches**
+
+Loops `add_row` (no native batch endpoint yet). Per-row cost on prod: ~175ms. For >100 rows, document-steer to the platform UI's CSV upload — the MCP can't produce S3 URIs.
+
+**Destructive ops guarded**
+
+`tables_delete`, `tables_delete_row`, `tables_delete_column` all require `confirm=True`. **Heads up**: these endpoints aren't shipped on the platform yet (M1 milestone) — calling today returns 405. The wrapper stays so callers don't have to refactor when M1 ships.
+
+**M2 wrappers exist in `tables_client.py` (server-side aggregate/distinct/batch-read/join)** but aren't exposed as MCP tools yet — same reason: not shipped on the platform. When they ship, expose with one decorator each.
+
+**New: `get_plugin_version`**
+
+Returns `{version, name, homepage}`. Useful for the support workflow when README/docs drift.
+
+Tool count: 55 → 75 (+19 tables, +1 version). Tests: 304 → 327 (+23 in `test_tables_mcp.py` + smoke-tested end-to-end against prod).
+
+No breaking changes to existing tools.
+
 ### v0.2.25 — prod-test-surfaced fixes: row-error tool + delete_node ergonomics + docs
 **The "first prod-comprehensive-test cleanup" release.** Three small fixes from the 2026-05-25 comprehensive prod test where I built a Query Table → Magic Node → Slack workflow on prod and surfaced three real issues.
 

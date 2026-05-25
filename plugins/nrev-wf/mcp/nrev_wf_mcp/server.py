@@ -15,6 +15,7 @@ from fastmcp import FastMCP
 from . import auth
 from . import block_types
 from . import client as api
+from . import tables_client as tables_api
 from .sandbox_lint import lint
 
 
@@ -5615,6 +5616,468 @@ def delete_sticky_note(workflow_id: str, note_id: str) -> dict:
         "ok": True,
         "deleted_note_id": note_id,
         "remaining_count": len(updated),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# nRev Tables — v0.2.26 (separate service, same JWT)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 19 tools wrapping nrev-tables-service.public.prod.nurturev.com. Verified
+# live on prod 2026-05-25. See docs/nrev_tables_api_investigation.md and
+# docs/PROD_COMPREHENSIVE_TEST_2026_05_25.md for the surface, bugs, and
+# design decisions.
+#
+# Auth: shared with workflow tools via the same set_jwt() — one JWT, two
+# services. No separate auth tool needed.
+#
+# UX convention: row values come back from the platform keyed by COLUMN UUID
+# (not column name). The wrapper tools below auto-translate names↔ids using
+# a per-call schema fetch from get_table(). Pass `by_column_id=True` to opt
+# out (advanced).
+
+
+# ─── Helper: name ↔ id translation ──────────────────────────────────────
+
+
+def _tables_resolve_name_map(table_id: str) -> dict:
+    """Fetch a table's schema once and return {column_name: column_id}.
+    Used by add_row / update_row / list_rows for name-keyed inputs/outputs."""
+    schema = tables_api.get_table(table_id)
+    return {c["name"]: c["id"] for c in (schema.get("columns") or [])}
+
+
+def _tables_translate_to_ids(values: dict, name_to_id: dict) -> dict:
+    """Translate a name-keyed dict to an id-keyed dict, surfacing any unknown
+    column names as a clean error."""
+    out = {}
+    unknown = []
+    for k, v in values.items():
+        if k in name_to_id:
+            out[name_to_id[k]] = v
+        else:
+            unknown.append(k)
+    if unknown:
+        raise ValueError(
+            f"Unknown column(s) for this table: {unknown}. "
+            f"Available: {sorted(name_to_id.keys())}"
+        )
+    return out
+
+
+def _tables_project_to_names(row_values: dict, id_to_name: dict,
+                              columns: Optional[list[str]] = None) -> dict:
+    """Translate id-keyed row values to name-keyed.
+
+    If `columns` is provided, also project to just those columns (drops
+    system columns and anything else not requested).
+    """
+    out = {}
+    for cid, v in row_values.items():
+        name = id_to_name.get(cid, cid)
+        out[name] = v
+    if columns:
+        out = {k: out.get(k) for k in columns}
+    return out
+
+
+# ─── Tables ─────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def tables_list(name: Optional[str] = None,
+                 creators: Optional[list[str]] = None,
+                 skip: int = 0,
+                 limit: int = 100) -> dict:
+    """List nRev tables in this tenant.
+
+    Tenant-scoped: returns tables created by anyone in the tenant, not just
+    the calling user. Use `tables_list_creators()` to discover user_ids for
+    the `creators` filter.
+
+    `name` is substring match. Sorting is NOT exposed — the platform's
+    sortBy is currently broken (every format returns 'Malformed sortBy
+    entry'). Default order is by creation desc.
+    """
+    return tables_api.list_tables(name=name, creators=creators,
+                                   skip=skip, limit=limit)
+
+
+@mcp.tool()
+def tables_list_creators() -> list:
+    """List the distinct creators (users) of tables in this tenant.
+    Use the returned user_ids to filter `tables_list(creators=...)`."""
+    return tables_api.list_table_creators()
+
+
+@mcp.tool()
+def tables_get(table_id: str) -> dict:
+    """Get full table schema including columns + UUIDs.
+
+    Use this BEFORE calling tables_add_row / tables_update_row if you want
+    to pass values by column name — those tools fetch the schema internally
+    but if you're iterating in a loop, do one fetch up front and cache.
+    """
+    return tables_api.get_table(table_id)
+
+
+@mcp.tool()
+def tables_create(name: str, columns: Optional[list[dict]] = None) -> dict:
+    """Create a new nRev table with optional inline columns.
+
+    `columns` entries: {"name": str, "type": <type>, "position": int?}.
+    Valid types: text | long_text | number | boolean | date | datetime | json.
+
+    The platform auto-creates 3 system columns at positions 0/1/2: row_id
+    (auto-incrementing int), added_at (datetime), last_updated_at
+    (datetime). Your user columns start at position 3.
+    """
+    return tables_api.create_table(name=name, columns=columns)
+
+
+@mcp.tool()
+def tables_rename(table_id: str, new_name: str) -> dict:
+    """Rename a table. table_id stays the same; only the display name
+    changes. Name must be 5-64 chars."""
+    return tables_api.rename_table(table_id, new_name)
+
+
+@mcp.tool()
+def tables_delete(table_id: str, confirm: bool = False) -> dict:
+    """Delete a table.
+
+    NOT YET LIVE — DELETE endpoints are M1 (not shipped as of 2026-05-25).
+    Wrapper exists so the surface is stable. Calling today returns HTTP 405.
+
+    `confirm=True` required (destructive, irreversible).
+    """
+    if not confirm:
+        return {
+            "ok": False,
+            "message": "Destructive operation. Pass confirm=True to actually delete.",
+        }
+    return tables_api.delete_table(table_id)
+
+
+# ─── Columns ────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def tables_add_column(table_id: str, name: str, type: str,
+                       position: Optional[int] = None) -> dict:
+    """Add a new typed column to an existing table.
+
+    Types: text | long_text | number | boolean | date | datetime | json.
+    `row_id` is system-reserved.
+
+    Column name must be unique within the table (409 on duplicate). Column
+    UUIDs are stable across renames — downstream references won't break if
+    you rename later.
+    """
+    return tables_api.add_column(table_id, name=name, col_type=type,
+                                  position=position)
+
+
+@mcp.tool()
+def tables_rename_column(table_id: str, column_id_or_name: str,
+                          new_name: str) -> dict:
+    """Rename a column. Accepts either the column UUID or the current
+    column name; auto-resolves names via get_table()."""
+    cid = column_id_or_name
+    if "-" not in cid or len(cid) < 30:
+        # Looks like a name, not a UUID — resolve
+        name_to_id = _tables_resolve_name_map(table_id)
+        if column_id_or_name not in name_to_id:
+            raise ValueError(
+                f"Column '{column_id_or_name}' not found. "
+                f"Available: {sorted(name_to_id.keys())}"
+            )
+        cid = name_to_id[column_id_or_name]
+    return tables_api.rename_column(table_id, cid, new_name)
+
+
+@mcp.tool()
+def tables_reorder_column(table_id: str, column_id_or_name: str,
+                            position: int) -> dict:
+    """Move a column to a new position. System columns (row_id, added_at,
+    last_updated_at) can't be reordered — 400 on attempt."""
+    cid = column_id_or_name
+    if "-" not in cid or len(cid) < 30:
+        name_to_id = _tables_resolve_name_map(table_id)
+        if column_id_or_name not in name_to_id:
+            raise ValueError(
+                f"Column '{column_id_or_name}' not found. "
+                f"Available: {sorted(name_to_id.keys())}"
+            )
+        cid = name_to_id[column_id_or_name]
+    return tables_api.reorder_column(table_id, cid, position)
+
+
+@mcp.tool()
+def tables_delete_column(table_id: str, column_id_or_name: str,
+                          confirm: bool = False) -> dict:
+    """Delete a column. NOT YET LIVE — M1 endpoint. Currently returns 405.
+    `confirm=True` required."""
+    if not confirm:
+        return {
+            "ok": False,
+            "message": "Destructive operation. Pass confirm=True to actually delete.",
+        }
+    cid = column_id_or_name
+    if "-" not in cid or len(cid) < 30:
+        name_to_id = _tables_resolve_name_map(table_id)
+        if column_id_or_name not in name_to_id:
+            raise ValueError(
+                f"Column '{column_id_or_name}' not found. "
+                f"Available: {sorted(name_to_id.keys())}"
+            )
+        cid = name_to_id[column_id_or_name]
+    return tables_api.delete_column(table_id, cid)
+
+
+# ─── Rows ───────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def tables_list_rows(table_id: str,
+                      filter: Optional[dict] = None,
+                      sort_by: Optional[str] = None,
+                      sort_direction: str = "desc",
+                      search: Optional[str] = None,
+                      columns: Optional[list[str]] = None,
+                      skip: int = 0,
+                      limit: int = 100) -> dict:
+    """List rows from a table with filter / sort / search / projection.
+
+    `filter` shape: {"column": "<name or id>", "operator": "<op>",
+                     "value": <scalar or list>}.
+    Operators: eq, neq, contains (case-insensitive), gt, gte, lt, lte,
+    is_empty, is_not_empty, in, not_in. For `in` / `not_in`, value is a list.
+
+    `sort_by` is a column name OR id. Defaults to row_id desc (newest first).
+
+    `columns` projects results to those columns only; values come back
+    name-keyed (not id-keyed). If omitted, returns all columns name-keyed.
+
+    `limit` auto-clamps to the nearest allowed value [100, 500, 1000, 5000,
+    10000, 50000, 100000] — the platform rejects arbitrary integers.
+    """
+    schema = tables_api.get_table(table_id)
+    name_to_id = {c["name"]: c["id"] for c in (schema.get("columns") or [])}
+    id_to_name = {v: k for k, v in name_to_id.items()}
+
+    def _resolve_col(cn):
+        if cn in name_to_id:
+            return name_to_id[cn]
+        if cn in id_to_name:
+            return cn  # already an id
+        raise ValueError(f"Unknown column '{cn}'. Available: {sorted(name_to_id.keys())}")
+
+    filter_column_id = None
+    filter_operator = None
+    filter_values = None
+    if filter:
+        filter_column_id = _resolve_col(filter.get("column"))
+        filter_operator = filter.get("operator")
+        v = filter.get("value")
+        filter_values = v if isinstance(v, list) else ([v] if v is not None else None)
+
+    sort_column_id = _resolve_col(sort_by) if sort_by else None
+
+    resp = tables_api.list_rows(
+        table_id,
+        skip=skip, limit=limit,
+        sort_column_id=sort_column_id,
+        sort_direction=sort_direction,
+        search=search,
+        filter_column_id=filter_column_id,
+        filter_operator=filter_operator,
+        filter_values=filter_values,
+    )
+
+    # Project rows to name-keyed
+    projected = []
+    for row in (resp.get("data") or []):
+        values = row.get("values") or {}
+        projected.append({
+            "row_id": row.get("row_id"),
+            "values": _tables_project_to_names(values, id_to_name, columns),
+            "created_at": row.get("created_at"),
+            "last_updated_at": row.get("last_updated_at"),
+        })
+    return {"data": projected, "meta": resp.get("meta")}
+
+
+@mcp.tool()
+def tables_fetch_all_rows(table_id: str,
+                            filter: Optional[dict] = None,
+                            sort_by: Optional[str] = None,
+                            sort_direction: str = "desc",
+                            max_rows: int = 10000,
+                            columns: Optional[list[str]] = None) -> dict:
+    """Fetch ALL rows from a table (auto-paginates with limit=1000).
+
+    Convenience wrapper around tables_list_rows for callers who don't want
+    to deal with pagination. Hard cap at `max_rows` (default 10k) to prevent
+    runaway. Beyond ~50k rows, prefer server-side aggregate when M2 ships.
+
+    Returns: {data: [...], meta: {total_fetched: N, capped: bool}}.
+    """
+    if max_rows <= 0:
+        raise ValueError("max_rows must be > 0")
+
+    all_rows = []
+    skip = 0
+    page_size = 1000
+    capped = False
+
+    while len(all_rows) < max_rows:
+        page = tables_list_rows(
+            table_id, filter=filter, sort_by=sort_by,
+            sort_direction=sort_direction, columns=columns,
+            skip=skip, limit=page_size,
+        )
+        rows = page.get("data") or []
+        if not rows:
+            break
+        all_rows.extend(rows)
+        skip += len(rows)
+        if len(rows) < page_size:
+            break
+        if len(all_rows) >= max_rows:
+            all_rows = all_rows[:max_rows]
+            capped = True
+            break
+
+    return {
+        "data": all_rows,
+        "meta": {
+            "total_fetched": len(all_rows),
+            "capped": capped,
+            "max_rows": max_rows,
+        },
+    }
+
+
+@mcp.tool()
+def tables_add_row(table_id: str, values: dict,
+                    by_column_id: bool = False) -> dict:
+    """Insert one row into a table.
+
+    `values`: dict keyed by COLUMN NAME (default) or COLUMN UUID
+    (by_column_id=True).
+
+    The platform stores rows keyed by column UUID. The default name-keyed
+    path fetches the table schema once and translates names → UUIDs.
+    Unknown column names raise a clear error.
+
+    Type validation is platform-side: a string in a number column → 400
+    "Cell type mismatch for column ...: expected number, got str."
+    """
+    if not by_column_id:
+        name_to_id = _tables_resolve_name_map(table_id)
+        values = _tables_translate_to_ids(values, name_to_id)
+        # Project response back to name-keyed for consistency with list_rows
+        resp = tables_api.add_row(table_id, values)
+        id_to_name = {v: k for k, v in name_to_id.items()}
+        if "row" in resp and "values" in resp["row"]:
+            resp["row"]["values"] = _tables_project_to_names(
+                resp["row"]["values"], id_to_name,
+            )
+        return resp
+    return tables_api.add_row(table_id, values)
+
+
+@mcp.tool()
+def tables_update_row(table_id: str, row_id: int, values: dict,
+                       by_column_id: bool = False) -> dict:
+    """Update one row by row_id. Merge semantics (PATCH): unchanged fields
+    keep their values; passing `null` for a field DELETES that field.
+
+    `row_id` is the platform's auto-incrementing integer (1, 2, 3, ...).
+    Get it from tables_list_rows / tables_fetch_all_rows responses.
+
+    Unknown row_id → 404 with a clean message.
+    """
+    if not by_column_id:
+        name_to_id = _tables_resolve_name_map(table_id)
+        values = _tables_translate_to_ids(values, name_to_id)
+        resp = tables_api.update_row(table_id, row_id, values)
+        id_to_name = {v: k for k, v in name_to_id.items()}
+        if isinstance(resp, dict) and "values" in resp:
+            resp["values"] = _tables_project_to_names(resp["values"], id_to_name)
+        return resp
+    return tables_api.update_row(table_id, row_id, values)
+
+
+@mcp.tool()
+def tables_delete_row(table_id: str, row_id: int,
+                       confirm: bool = False) -> dict:
+    """Delete one row. NOT YET LIVE — M1 endpoint. Currently 405.
+    `confirm=True` required."""
+    if not confirm:
+        return {
+            "ok": False,
+            "message": "Destructive operation. Pass confirm=True to actually delete.",
+        }
+    return tables_api.delete_row(table_id, row_id)
+
+
+@mcp.tool()
+def tables_bulk_add_rows(table_id: str, rows: list[dict],
+                          by_column_id: bool = False,
+                          stop_on_error: bool = False) -> dict:
+    """Insert multiple rows. Loops over tables_add_row.
+
+    Per-row cost on prod (2026-05-25 measurement): ~175ms sequential.
+    For >100 rows, this gets slow. The platform has CSV import endpoints
+    (POST /tables/csv/import + /csv/append) but they require an s3://
+    URI which the MCP can't produce; the MCP-built CSV import path is
+    deferred until the platform exposes inline-content or presigned-URL
+    upload.
+
+    `stop_on_error=False` (default): continue on per-row failures, collect
+    them. `stop_on_error=True`: raise on first error.
+
+    Returns: {inserted: [{row_id, index}, ...], errors: [{index, error}, ...],
+              total_attempted: N}.
+    """
+    if not rows:
+        return {"inserted": [], "errors": [], "total_attempted": 0}
+
+    if not by_column_id:
+        name_to_id = _tables_resolve_name_map(table_id)
+        rows = [_tables_translate_to_ids(r, name_to_id) for r in rows]
+
+    inserted = []
+    errors = []
+    for i, values in enumerate(rows):
+        try:
+            resp = tables_api.add_row(table_id, values)
+            inserted.append({"row_id": resp["row"]["row_id"], "index": i})
+        except Exception as e:
+            errors.append({"index": i, "error": f"{type(e).__name__}: {str(e)[:300]}"})
+            if stop_on_error:
+                break
+    return {
+        "inserted": inserted,
+        "errors": errors,
+        "total_attempted": len(inserted) + len(errors),
+    }
+
+
+# ─── Misc ───────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def get_plugin_version() -> dict:
+    """Return the running MCP plugin version. Useful for the support
+    workflow when README/docs drift from the actual code."""
+    from . import __version__
+    return {
+        "version": __version__,
+        "name": "nrev-wf-mcp",
+        "homepage": "https://github.com/nurturev-dev/nrev-workflow-mcp",
     }
 
 
