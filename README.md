@@ -226,6 +226,27 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
 
+### v0.2.25 — prod-test-surfaced fixes: row-error tool + delete_node ergonomics + docs
+**The "first prod-comprehensive-test cleanup" release.** Three small fixes from the 2026-05-25 comprehensive prod test where I built a Query Table → Magic Node → Slack workflow on prod and surfaced three real issues.
+
+**Fix #1 — new `check_node_errors` tool + improved diagnostic**
+
+Pipedream-wrapped actions (Slack Send, Sheets Add Row, Gmail Send) report block-level `status: completed, error: null` even when the underlying action failed (network call to Slack/Sheets/etc. returned HTTP 200 with an error in the body). The real error lives in row[0].error/error_1. v0.2.20 Fix F added auto-detection in `partial_execute`; v0.2.25 adds an explicit `check_node_errors(workflow_id, execution_id, node_id?)` tool that callers can invoke deterministically — useful when `tail_execution`'s auto-detection misses or when you want to scan all Pipedream blocks at once.
+
+Also improved the underlying `_check_pipedream_row_error` helper to return a `_diagnostic` field when the preview fetch fails (e.g. expired execution, handle_condition mismatch) — pre-fix these were silently swallowed and callers got "no errors detected" for the wrong reason.
+
+**Fix #2 — `delete_node` accepts `confirm=True` as a no-op**
+
+`delete_workflow(confirm=True)` requires confirm; `delete_node(confirm=True)` was raising `Unexpected keyword argument`. Agents who learned the destructive-op pattern from delete_workflow hit this. Now both APIs accept `confirm` (no-op on delete_node; required on delete_workflow). Symmetric, no breaking changes.
+
+**Fix #3 — `validate_workflow` docstring documents stale-cache behavior**
+
+Platform-side validation can briefly echo back errors for recently-deleted node_ids — the cache lags by a request or two. Docstring now tells callers: if you see a `node_errors[].node_id` not in `get_workflow_graph`, run any small mutation to force refresh; don't waste time chasing ghost errors.
+
+Tool count: 54 → 55 (added `check_node_errors`). Tests: 294 → 304 (+10 in `test_v0_2_25_fixes.py`).
+
+No breaking changes.
+
 ### v0.2.24 — two silent-failure killers: CC passthrough + array-stringify
 **The "stop the bleeding before adding features" release.** Two silent-failure bugs surfaced this week via live reproduction. Both shipped fixes + tests.
 

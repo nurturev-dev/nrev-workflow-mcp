@@ -546,6 +546,14 @@ def validate_workflow(workflow_id: str) -> dict:
       magic_ref_warnings     — Magic Node references that don't look like edge IDs
                                (must be '<src>-<src_handle>-<magic>-<tgt_handle>',
                                 NOT raw node UUIDs)
+
+    v0.2.25: be aware that platform-side validation can briefly echo back
+    errors for recently-deleted node_ids — the validation cache lags behind
+    the mutation by one or two requests. If you see a `node_errors[].node_id`
+    that isn't in the current `get_workflow_graph` output, run any small
+    mutation (e.g. another `validate_workflow` call, or a no-op
+    `update_node_setting`) to force the cache to refresh. Self-heals
+    quickly; don't waste time chasing ghost errors.
     """
     return _validate_workflow_impl(workflow_id)
 
@@ -1512,13 +1520,20 @@ def _check_pipedream_row_error(workflow_id: str, execution_id: str,
     helper reads that row and returns a structured dict:
         {"has_row_error": bool, "row_error": <str | None>, "error_attribution": <dict | None>}
     or None if the output couldn't be read.
+
+    v0.2.25: include `_diagnostic` field when the preview fetch fails — pre-fix,
+    `_maybe_enrich_pipedream_errors` silently dropped these so callers got
+    `has_pipedream_row_errors: undefined` even when the platform refused the
+    preview call (e.g., handle_condition mismatch, expired execution).
     """
     try:
         rows_resp = api.get_node_preview(workflow_id, execution_id, block_id,
                                           handle_condition="_default",
                                           skip=0, limit=1)
-    except Exception:
-        return None
+    except Exception as e:
+        return {"has_row_error": False, "row_error": None,
+                "error_attribution": None,
+                "_diagnostic": f"preview fetch failed: {type(e).__name__}: {str(e)[:200]}"}
     # The API returns the rows under "entries" (full response shape) and the
     # server tool surfaces them as "rows" — accept either.
     rows = None
@@ -1631,6 +1646,99 @@ def _slim_execution(raw: dict, timed_out: bool,
         result["has_pipedream_row_errors"] = True
         result["pipedream_row_error_count"] = len(pr)
     return result
+
+
+@mcp.tool()
+def check_node_errors(workflow_id: str, execution_id: str,
+                       node_id: Optional[str] = None) -> dict:
+    """Explicitly check for Pipedream row-level errors that block-level
+    status doesn't surface.
+
+    v0.2.25 — split out from the auto-detection in `tail_execution` so callers
+    have a deterministic way to ask "did this Pipedream node ACTUALLY work?"
+    when the block reports `status: completed, error: null`.
+
+    Why this exists: Pipedream-wrapped actions (Slack Send Message, Sheets Add
+    Row, Gmail Send, Calendar Create Event, etc.) report `status: completed,
+    error: null` even when the underlying action failed at the Pipedream layer
+    (the network call to Slack/Sheets/etc. returned HTTP 200 with an error in
+    the body). The real error lives in the row's `error` / `error_1` column.
+    The 2026-05-25 comprehensive prod test caught this: a Slack node returned
+    `invalid_blocks` inside an HTTP 200 response; `tail_execution` honestly
+    reported "completed, no error" because that's what the platform said.
+
+    If `node_id` is provided, check only that block. If omitted, scan ALL
+    Pipedream-shaped blocks in the execution.
+
+    Returns:
+        {
+          "execution_id": "...",
+          "checked_block_count": N,
+          "blocks_with_errors": [
+            {"block_id": "...", "block_name": "...", "row_error": "<msg>",
+             "error_attribution": {...}}
+          ],
+          "blocks_without_errors": [<block_id>, ...],
+          "skipped_non_pipedream": [<block_id>, ...],
+          "diagnostics": [<block_id>: "<reason if check failed>", ...]
+        }
+    """
+    raw = api.get_execution_detail(workflow_id, execution_id)
+    block_runs = raw.get("blockRuns") or []
+    if not block_runs:
+        return {
+            "execution_id": execution_id,
+            "checked_block_count": 0,
+            "blocks_with_errors": [],
+            "blocks_without_errors": [],
+            "skipped_non_pipedream": [],
+            "diagnostics": [],
+            "note": "Execution has no block_runs yet — still running?",
+        }
+
+    wf = api.get_workflow(workflow_id)
+    blocks_by_id = {b.get("id"): b for b in (wf.get("blocks") or [])}
+
+    blocks_with_errors = []
+    blocks_without = []
+    skipped = []
+    diagnostics = []
+
+    for br in block_runs:
+        bid = br.get("workflowBlockId")
+        if not bid:
+            continue
+        if node_id and bid != node_id:
+            continue  # filter to single block
+        block = blocks_by_id.get(bid)
+        if not block or not _is_pipedream_block(block):
+            skipped.append(bid)
+            continue
+        chk = _check_pipedream_row_error(workflow_id, execution_id, bid)
+        if not chk:
+            diagnostics.append({"block_id": bid, "diagnostic": "helper returned None (unexpected)"})
+            continue
+        if chk.get("_diagnostic"):
+            diagnostics.append({"block_id": bid, "diagnostic": chk["_diagnostic"]})
+            continue
+        if chk.get("has_row_error"):
+            blocks_with_errors.append({
+                "block_id": bid,
+                "block_name": br.get("workflowBlockName"),
+                "row_error": chk.get("row_error"),
+                "error_attribution": chk.get("error_attribution"),
+            })
+        else:
+            blocks_without.append(bid)
+
+    return {
+        "execution_id": execution_id,
+        "checked_block_count": len(blocks_with_errors) + len(blocks_without),
+        "blocks_with_errors": blocks_with_errors,
+        "blocks_without_errors": blocks_without,
+        "skipped_non_pipedream": skipped,
+        "diagnostics": diagnostics,
+    }
 
 
 @mcp.tool()
@@ -2080,7 +2188,9 @@ def remove_edge(
 
 
 @mcp.tool()
-def delete_node(workflow_id: str, node_id: str, validate_after: bool = True) -> dict:
+def delete_node(workflow_id: str, node_id: str,
+                 validate_after: bool = True,
+                 confirm: bool = False) -> dict:
     """Delete a block and cascade-clean all incident edges.
 
     Removes:
@@ -2101,9 +2211,16 @@ def delete_node(workflow_id: str, node_id: str, validate_after: bool = True) -> 
     are still surfaced separately for callers who care about post-delete
     workflow state.
 
+    v0.2.25: `confirm` is accepted as a no-op (for symmetry with
+    `delete_workflow(confirm=True)`). Agents that learned the destructive-op
+    pattern from `delete_workflow` were getting Pydantic validation errors
+    here. Either value works; the delete fires either way. NOTE: this differs
+    from `delete_workflow` where `confirm=True` is REQUIRED.
+
     Returns `{ok, deleted_node_id, deleted_node_name, incoming_edges_removed,
     outgoing_edges_removed, workflowConfigError, isRunable, validation}`.
     """
+    _ = confirm  # accepted for ergonomic symmetry; no-op
     wf = api.get_workflow(workflow_id)
     target = next((b for b in wf["blocks"] if b["id"] == node_id), None)
     if target is None:
