@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>nRev Tables — Campaign Dashboard (live)</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#0a0e1a; --panel:#141a2a; --border:#1f2940; --text:#e8eaf0; --muted:#8b94aa; --accent:#7aa2ff; --good:#5eead4; --warn:#fbbf24; --bad:#f87171; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px; }
+  h1 { margin:0 0 4px 0; font-size:24px; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:24px; }
+  .row { display:grid; gap:16px; margin-bottom:16px; }
+  .kpis { grid-template-columns: repeat(6, 1fr); }
+  .charts { grid-template-columns: 2fr 1fr; }
+  .charts2 { grid-template-columns: 1fr 1fr; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px; }
+  .kpi-label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em; margin-bottom:6px; }
+  .kpi-value { font-size:24px; font-weight:600; }
+  .kpi-sub { color:var(--muted); font-size:11px; margin-top:4px; }
+  .panel h3 { margin:0 0 12px 0; font-size:14px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  canvas { max-width:100%; }
+  .filter-bar { display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap; align-items:center; }
+  .filter-bar button { background:var(--panel); color:var(--text); border:1px solid var(--border); padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px; }
+  .filter-bar button.active { background:var(--accent); color:var(--bg); border-color:var(--accent); }
+  .filter-bar label { color:var(--muted); font-size:12px; margin-right:8px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; color:var(--muted); font-weight:500; padding:8px 12px; border-bottom:1px solid var(--border); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  td { padding:10px 12px; border-bottom:1px solid var(--border); }
+  td.right { text-align:right; }
+  .status { padding:8px 16px; border-radius:4px; font-size:12px; margin-bottom:16px; }
+  .status.loading { background:#1e293b; color:var(--accent); }
+  .status.ok { background:#0d2818; color:var(--good); }
+  .status.err { background:#321818; color:var(--bad); }
+  .chip { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; background:var(--border); }
+  .chip.paused { background:#3a1f1f; color:var(--bad); }
+  input { background:var(--bg); color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:4px; font-size:12px; width:600px; font-family:monospace; }
+</style>
+</head>
+<body>
+
+<h1>📊 nRev Tables — Campaign Dashboard <span style="color:#fbbf24;font-size:12px;font-weight:600;background:#3a2f0e;padding:4px 10px;border-radius:4px;vertical-align:middle">DEV / TEST ONLY</span></h1>
+<div class="sub">
+  Live demo: HTML page → fetches directly from <code>nrev-tables-service</code> staging → renders with Chart.js. <strong>Zero backend; the tables service IS the backend.</strong>
+</div>
+<div class="sub" style="border-left:3px solid #fbbf24;padding:8px 12px;background:#1a1606;margin-bottom:16px">
+  ⚠ <strong>Not the production pattern.</strong> Customer-facing dashboards ship inside <code>app.nrev.ai</code> as same-origin iframes and read the JWT from <code>window.parent.__NREV_JWT__</code> — see <a href="https://github.com/nurturev/documentations/blob/main/nrev_tables/dashboard/dev_guide/dashboard_developer_playbook.md" style="color:#7aa2ff">dashboard developer playbook</a>. This page is for dev / API exploration / "build outside the platform" prototypes only.
+</div>
+
+<div class="filter-bar">
+  <label>JWT:</label>
+  <input id="jwt" placeholder="paste Bearer token here">
+  <button onclick="load()">Reload</button>
+  <span style="flex:1"></span>
+  <label>Industry:</label>
+  <button class="industry-btn active" data-ind="all">All</button>
+  <button class="industry-btn" data-ind="saas">SaaS</button>
+  <button class="industry-btn" data-ind="fintech">Fintech</button>
+  <button class="industry-btn" data-ind="healthcare">Healthcare</button>
+  <button class="industry-btn" data-ind="ecommerce">Ecommerce</button>
+  <button class="industry-btn" data-ind="manufacturing">Mfg</button>
+  <button class="industry-btn" data-ind="edtech">Edtech</button>
+</div>
+
+<div id="status" class="status loading">Loading…</div>
+
+<div class="row kpis">
+  <div class="panel"><div class="kpi-label">Total sent</div><div class="kpi-value" id="kpi-sent">—</div></div>
+  <div class="panel"><div class="kpi-label">Opened</div><div class="kpi-value" id="kpi-opened">—</div><div class="kpi-sub" id="kpi-opened-rate">—</div></div>
+  <div class="panel"><div class="kpi-label">Replied</div><div class="kpi-value" id="kpi-replied">—</div><div class="kpi-sub" id="kpi-replied-rate">—</div></div>
+  <div class="panel"><div class="kpi-label">Booked</div><div class="kpi-value" id="kpi-booked">—</div><div class="kpi-sub" id="kpi-booked-rate">—</div></div>
+  <div class="panel"><div class="kpi-label">Spend (USD)</div><div class="kpi-value" id="kpi-spend">—</div></div>
+  <div class="panel"><div class="kpi-label">Cost / booking</div><div class="kpi-value" id="kpi-cpb">—</div></div>
+</div>
+
+<div class="row charts">
+  <div class="panel"><h3>Daily sends (timeseries)</h3><canvas id="chart-time"></canvas></div>
+  <div class="panel"><h3>Booked by channel</h3><canvas id="chart-channel"></canvas></div>
+</div>
+
+<div class="row charts2">
+  <div class="panel"><h3>Funnel: sent → opened → replied → booked, by channel</h3><canvas id="chart-funnel"></canvas></div>
+  <div class="panel"><h3>Top 10 campaigns by bookings</h3>
+    <table>
+      <thead><tr><th>Date</th><th>Channel</th><th>Industry</th><th class="right">Sent</th><th class="right">Booked</th><th class="right">CPB</th><th>Status</th></tr></thead>
+      <tbody id="top-table"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const BASE = 'https://nrev-tables-service.public.staging.nurturev.com';
+const TABLE_ID = '671815e5-06c1-40e7-a593-1ad43597c9e4';
+
+// column UUIDs (captured from create-table response)
+const C = {
+  campaign_date: 'ff50d738-c23f-4aa3-a747-49ce22f5f2c6',
+  channel:       'acec6420-0d54-4811-994c-dc4bd59f515e',
+  industry:      '3fe6159e-00f8-4eeb-8a66-b5aaf109b88e',
+  sent:          'a2a32a55-13a5-482b-a0c3-dea373d95af8',
+  opened:        '2f1d2a3b-e61e-4928-83c0-7a619fa60588',
+  replied:       'bdb96ec3-b994-4de0-b162-2c29a86cf4ce',
+  booked:        '38708ce2-624c-42d2-b825-edaa1feb8a50',
+  spend_usd:     'fb78b9fe-5297-4194-958e-198f81545de5',
+  is_paused:     '48fa0041-fcba-4aa8-b6e8-eb0e7eda7a21',
+};
+
+const CHANNEL_COLORS = {
+  email: '#7aa2ff',
+  linkedin: '#0a66c2',
+  cold_call: '#fbbf24',
+  ads: '#f87171',
+  webinar: '#5eead4',
+};
+
+let allRows = [];
+let chartRefs = {};
+let currentIndustry = 'all';
+
+// --- Helpers (these are the "client-side analytics primitives") ---
+function nameKeyed(row) {
+  const out = { row_id: row.row_id };
+  for (const [name, cid] of Object.entries(C)) out[name] = row.values[cid];
+  return out;
+}
+function sum(arr, fn) { return arr.reduce((s,x)=>s+(fn(x)||0),0); }
+function groupBy(arr, key) {
+  const m = new Map();
+  for (const r of arr) {
+    const k = typeof key === 'function' ? key(r) : r[key];
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(r);
+  }
+  return m;
+}
+function distinct(arr, key) { return [...new Set(arr.map(r=>r[key]))].sort(); }
+function pct(num, den) { return den > 0 ? (num/den*100).toFixed(1)+'%' : '—'; }
+function money(n) { return '$' + (n||0).toLocaleString('en-US', {maximumFractionDigits:0}); }
+
+async function fetchAllRows(jwt) {
+  // Single fetch since we know it's <1000 rows. For prod-scale, would loop with skip.
+  const t0 = performance.now();
+  const r = await fetch(`${BASE}/tables/${TABLE_ID}/rows?limit=1000`, {
+    headers: {'Authorization': 'Bearer ' + jwt}
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + (await r.text()));
+  const j = await r.json();
+  const t1 = performance.now();
+  console.log(`Fetched ${j.data.length} rows in ${(t1-t0).toFixed(0)}ms`);
+  return j.data.map(nameKeyed);
+}
+
+function render() {
+  // Filter
+  const rows = currentIndustry === 'all'
+    ? allRows
+    : allRows.filter(r => r.industry === currentIndustry);
+  const activeRows = rows.filter(r => !r.is_paused);
+
+  // KPIs
+  const tSent = sum(activeRows, r=>r.sent);
+  const tOpened = sum(activeRows, r=>r.opened);
+  const tReplied = sum(activeRows, r=>r.replied);
+  const tBooked = sum(activeRows, r=>r.booked);
+  const tSpend = sum(activeRows, r=>r.spend_usd);
+  document.getElementById('kpi-sent').textContent = tSent.toLocaleString();
+  document.getElementById('kpi-opened').textContent = tOpened.toLocaleString();
+  document.getElementById('kpi-opened-rate').textContent = pct(tOpened, tSent) + ' open rate';
+  document.getElementById('kpi-replied').textContent = tReplied.toLocaleString();
+  document.getElementById('kpi-replied-rate').textContent = pct(tReplied, tSent) + ' reply rate';
+  document.getElementById('kpi-booked').textContent = tBooked.toLocaleString();
+  document.getElementById('kpi-booked-rate').textContent = pct(tBooked, tReplied) + ' of replies';
+  document.getElementById('kpi-spend').textContent = money(tSpend);
+  document.getElementById('kpi-cpb').textContent = tBooked > 0 ? money(tSpend/tBooked) : '—';
+
+  // Time series (group by date)
+  const byDate = groupBy(activeRows, 'campaign_date');
+  const dates = [...byDate.keys()].sort();
+  const dailySent = dates.map(d => sum(byDate.get(d), r=>r.sent));
+  const dailyBooked = dates.map(d => sum(byDate.get(d), r=>r.booked));
+  drawChart('chart-time', 'line', {
+    labels: dates,
+    datasets: [
+      {label:'Sent', data:dailySent, borderColor:'#7aa2ff', tension:.25, yAxisID:'y'},
+      {label:'Booked (×10)', data:dailyBooked.map(x=>x*10), borderColor:'#5eead4', tension:.25, yAxisID:'y'},
+    ]
+  }, {scales:{y:{ticks:{color:'#8b94aa'},grid:{color:'#1f2940'}}, x:{ticks:{color:'#8b94aa',maxTicksLimit:10},grid:{color:'#1f2940'}}}});
+
+  // Booked by channel (pie)
+  const byChannel = groupBy(activeRows, 'channel');
+  const channels = [...byChannel.keys()].sort();
+  drawChart('chart-channel', 'doughnut', {
+    labels: channels,
+    datasets: [{
+      data: channels.map(c => sum(byChannel.get(c), r=>r.booked)),
+      backgroundColor: channels.map(c => CHANNEL_COLORS[c] || '#888'),
+      borderColor: '#141a2a', borderWidth: 2,
+    }]
+  });
+
+  // Funnel by channel (stacked bar of conversion rates)
+  drawChart('chart-funnel', 'bar', {
+    labels: channels,
+    datasets: [
+      {label:'Sent',    data:channels.map(c=>sum(byChannel.get(c),r=>r.sent)),    backgroundColor:'#7aa2ff'},
+      {label:'Opened',  data:channels.map(c=>sum(byChannel.get(c),r=>r.opened)),  backgroundColor:'#5eead4'},
+      {label:'Replied', data:channels.map(c=>sum(byChannel.get(c),r=>r.replied)*5), backgroundColor:'#fbbf24'},
+      {label:'Booked',  data:channels.map(c=>sum(byChannel.get(c),r=>r.booked)*20),  backgroundColor:'#a78bfa'},
+    ]
+  }, {scales:{y:{ticks:{color:'#8b94aa'},grid:{color:'#1f2940'}}, x:{ticks:{color:'#8b94aa'},grid:{color:'#1f2940'}}}});
+
+  // Top 10 campaigns table
+  const top = [...rows].sort((a,b)=>b.booked - a.booked).slice(0,10);
+  document.getElementById('top-table').innerHTML = top.map(r => `
+    <tr>
+      <td>${r.campaign_date}</td>
+      <td><span class="chip" style="background:${CHANNEL_COLORS[r.channel]}33;color:${CHANNEL_COLORS[r.channel]}">${r.channel}</span></td>
+      <td>${r.industry}</td>
+      <td class="right">${(r.sent||0).toLocaleString()}</td>
+      <td class="right">${r.booked}</td>
+      <td class="right">${r.booked > 0 ? money(r.spend_usd/r.booked) : '—'}</td>
+      <td>${r.is_paused ? '<span class="chip paused">paused</span>' : '<span class="chip">active</span>'}</td>
+    </tr>
+  `).join('');
+}
+
+function drawChart(id, type, data, options={}) {
+  if (chartRefs[id]) chartRefs[id].destroy();
+  const ctx = document.getElementById(id);
+  chartRefs[id] = new Chart(ctx, {
+    type, data,
+    options: {
+      responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{labels:{color:'#e8eaf0',font:{size:11}}}},
+      ...options
+    }
+  });
+  ctx.parentElement.style.height = '280px';
+}
+
+async function load() {
+  const jwt = document.getElementById('jwt').value.trim();
+  if (!jwt) { showStatus('Paste your JWT first.', 'err'); return; }
+  localStorage.setItem('nrev_jwt', jwt);
+  showStatus('Fetching from tables service…', 'loading');
+  try {
+    const t0 = performance.now();
+    allRows = await fetchAllRows(jwt);
+    const t1 = performance.now();
+    showStatus(`✓ ${allRows.length} rows fetched in ${(t1-t0).toFixed(0)}ms from nrev-tables-service.public.staging`, 'ok');
+    render();
+  } catch (e) {
+    showStatus('Error: ' + e.message, 'err');
+    console.error(e);
+  }
+}
+
+function showStatus(msg, kind) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status ' + kind;
+}
+
+document.querySelectorAll('.industry-btn').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('.industry-btn').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    currentIndustry = b.dataset.ind;
+    if (allRows.length) render();
+  });
+});
+
+// Restore JWT from localStorage
+const savedJwt = localStorage.getItem('nrev_jwt');
+if (savedJwt) {
+  document.getElementById('jwt').value = savedJwt;
+  load();
+} else {
+  showStatus('Paste a Bearer JWT and click Reload.', 'loading');
+}
+</script>
+</body>
+</html>

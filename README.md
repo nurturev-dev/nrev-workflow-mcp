@@ -226,6 +226,31 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
 
+### v0.2.24 — two silent-failure killers: CC passthrough + array-stringify
+**The "stop the bleeding before adding features" release.** Two silent-failure bugs surfaced this week via live reproduction. Both shipped fixes + tests.
+
+**Fix #1 — `update_node_setting` parses JSON-string values into lists/dicts**
+
+When a caller passes a structured value (list/dict) to `update_node_setting`, the MCP transport coerces it to a JSON string. Without defensive parsing on the server side, the value lands in the platform's settings tree as the literal string `'["a","b"]'`. The platform validator then iterates over the string character-by-character — one warning per `[`, `"`, `e`, `d`, `g`, … character.
+
+Live reproduction: trying to update a Magic Node's `references` field (a list of edge IDs) produced 100+ warnings, one per character of the JSON-stringified list. A previous Claude session had hit this and given up on edits entirely, choosing to delete the broken Magic Node and rebuild from scratch with `attach_magic_node`.
+
+Fix: `update_node_setting` now detects strings that look like JSON arrays/objects (start with `[` or `{`), tries `json.loads()`, and uses the parsed result if it returns a list/dict. Strings that *look* like JSON but aren't (e.g. `"[draft] Q2 outreach"`) stay as strings. Scalars (ints, floats, bools) pass through unchanged.
+
+**Fix #2 — `attach_python_block` refuses by default, steers callers to `attach_magic_node`**
+
+Live reproduction confirmed Custom Code attached via the MCP is fundamentally broken: the platform silently discards the user's code return value and passes the parent's data through verbatim. Status: completed. Error: none. The user-visible symptom is "I wrote code that should produce X but I got the parent's data with no new columns/rows."
+
+Magic Node uses the same Python sandbox, the same `def run(df1): ... return df` shape, and works correctly. The only signature difference is `df` vs `df1`.
+
+Fix: `attach_python_block` now returns a structured refusal by default with the pre-built `attach_magic_node` arguments (including auto-converted code: `def run(df)` → `def run(df1)`). Callers who absolutely need raw CC (e.g., editing a workflow built outside the MCP that already has a working CC) can pass `i_understand_cc_is_broken=True` to bypass the guard. Even then, expect silent passthrough — verify with `partial_execute + get_node_output` immediately.
+
+See `docs/CC_BUG_REPRO_2026_05_25.md` for the full reproduction + root cause.
+
+Tool count: 54 → 54 (no new tools). Tests: 286 → 294 (+8 in `test_v0_2_24_fixes.py`).
+
+No breaking changes — both fixes are guards with explicit overrides; existing callers that weren't hitting the bugs are unaffected.
+
 ### v0.2.23 — three correctness bugs the GTM stress-test surfaced
 **The "less footguns, no new tools" release.** A real-world GTM workflow build (Pipedream → Magic Node → CC → Sheets Update) caught three silent-correctness bugs in the v0.2.22 build pipeline. All three now fixed with regression tests. No new tools, no API additions — just sharper edges filed down.
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import json as _json
 import uuid
 from typing import Optional
 
@@ -1064,8 +1065,33 @@ def attach_python_block(
     position_x: Optional[float] = None,
     position_y: Optional[float] = None,
     validate_after: bool = True,
+    i_understand_cc_is_broken: bool = False,
 ) -> dict:
-    """Attach a Custom Code (Python) block downstream of an existing node.
+    """⚠️ DO NOT USE — Custom Code is broken via the MCP (v0.2.24).
+
+    USE `attach_magic_node` INSTEAD with `parent_node_ids=[parent_node_id]`.
+
+    What's broken: live reproduction on 2026-05-25 confirmed that CC nodes
+    attached via this tool run "successfully" but the platform silently
+    discards the code's return value and passes through the parent's data
+    verbatim. Status: completed. Error: none. The user-visible symptom is
+    "I wrote code that should produce X but I got the parent's data with no
+    new columns/rows."
+
+    Magic Node uses the same Python sandbox, the same `def run(df1): ... return
+    df` shape, and works correctly. Only difference: signature is `df1` not
+    `df`. See docs/CC_BUG_REPRO_2026_05_25.md for the full repro + root cause.
+
+    If you absolutely need a raw Custom Code node (the only known reason is a
+    workflow built outside the MCP that already has a working CC and you want
+    to clone it), pass `i_understand_cc_is_broken=True` to override the block.
+    Even then expect silent passthrough — verify with `partial_execute` +
+    `get_node_output` immediately and convert to MN if the output is wrong.
+
+    -----
+
+    (original docstring, retained for historical context — only relevant if
+    you've overridden the block:)
 
     PREFER `attach_magic_node` IN MOST CASES. Magic Node accepts 1-5 inputs
     (so you can fold joins/merges into the same step) and works identically
@@ -1110,6 +1136,45 @@ def attach_python_block(
 
     Position defaults to 400 px right of parent.
     """
+    # v0.2.24 Fix #2: Custom Code is broken — code is silently ignored at
+    # runtime, parent data passes through verbatim. Refuse by default and
+    # steer to attach_magic_node. Live-reproduced on 2026-05-25; see
+    # docs/CC_BUG_REPRO_2026_05_25.md.
+    if not i_understand_cc_is_broken:
+        return {
+            "ok": False,
+            "stage": "cc_silent_failure_guard",
+            "message": (
+                "⚠️ Custom Code attach is broken via the MCP. The platform "
+                "silently discards your code's return value and passes the "
+                "parent's data through verbatim with status=completed and no "
+                "error. Use attach_magic_node instead — same Python sandbox, "
+                "same return shape, but it actually runs your code."
+            ),
+            "use_instead": {
+                "tool": "attach_magic_node",
+                "args": {
+                    "workflow_id": workflow_id,
+                    "parent_node_ids": [parent_node_id],
+                    "name": name,
+                    "code": code.replace("def run(df)", "def run(df1)").replace("run(df)", "run(df1)"),
+                    "output_columns": output_columns,
+                    "instructions_text": description or f"Magic Node: {name}",
+                },
+            },
+            "note": (
+                "Magic Node uses `df1` instead of `df`. The `use_instead.args.code` "
+                "above is auto-converted. Verify the conversion looks right "
+                "before calling."
+            ),
+            "override": (
+                "If you absolutely must create a raw CC node, pass "
+                "i_understand_cc_is_broken=True. Expect silent passthrough; "
+                "verify with partial_execute + get_node_output."
+            ),
+            "docs": "docs/CC_BUG_REPRO_2026_05_25.md",
+        }
+
     issues = lint(code)
     blocking = [i for i in issues if i.is_blocking]
     warnings = [i for i in issues if not i.is_blocking]
@@ -2406,6 +2471,25 @@ def update_node_setting(
     pass `verify_cost_ack=True` to confirm the spend. Without ack, verify is
     skipped on paid nodes and an explanatory note is returned.
     """
+    # v0.2.24 Fix #1: MCP transport coerces structured values (lists/dicts) to
+    # JSON strings under some callers. If we receive a string that LOOKS like
+    # JSON (starts with [ or {), try to parse it back. Without this defensive
+    # coerce, a `references` array on a Magic Node arrives as the literal
+    # string '["edge1","edge2"]' and the platform validator iterates over it
+    # character-by-character (one warning per `[`, `"`, `e`, `d`, `g`, …).
+    # Detected via the screenshot in the 2026-05-25 session — Claude burned
+    # several attempts trying to edit Magic Node references before giving up
+    # and rebuilding the node.
+    if isinstance(value, str) and value and value[0] in "[{":
+        try:
+            parsed = _json.loads(value)
+            if isinstance(parsed, (list, dict)):
+                value = parsed
+        except (_json.JSONDecodeError, ValueError):
+            # Not JSON — value is a string that happens to start with [ or {.
+            # Leave it as-is (the field probably expects exactly that string).
+            pass
+
     wf = api.get_workflow(workflow_id)
     target = next((b for b in wf["blocks"] if b["id"] == node_id), None)
     if target is None:

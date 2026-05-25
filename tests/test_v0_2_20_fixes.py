@@ -209,6 +209,7 @@ def test_attach_python_block_refuses_empty_output_columns_for_pipedream_parent()
             name="bad-cc",
             code="def run(df):\n    return df\n",
             output_columns=[],  # the footgun
+            i_understand_cc_is_broken=True,  # v0.2.24: bypass the CC silent-failure guard
         )
 
     assert result["ok"] is False
@@ -243,6 +244,7 @@ def test_attach_python_block_allows_empty_output_columns_for_non_pipedream_paren
             name="ok-cc",
             code="def run(df): return df",
             output_columns=[],  # legitimate for plain chain
+            i_understand_cc_is_broken=True,  # v0.2.24: bypass the CC silent-failure guard
         )
 
     # No Pipedream-guard failure
