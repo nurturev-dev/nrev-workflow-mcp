@@ -8,11 +8,11 @@
   "plugins": [
     {
       "name": "nrev-wf",
-      "description": "Build, debug, and operate nRev workflows + nRev tables from Claude — 75 tools (55 workflow + 19 tables + version). Per-user JWT auth, no secrets bundled.",
+      "description": "Build, debug, and operate nRev workflows + nRev tables from Claude — 76 tools (55 workflow + 19 tables + monitoring + version). Per-user JWT auth, no secrets bundled.",
       "source": "./plugins/nrev-wf",
       "category": "productivity",
-      "keywords": ["nrev", "workflow", "tables", "gtm", "mcp"],
-      "version": "0.2.26"
+      "keywords": ["nrev", "workflow", "tables", "monitoring", "gtm", "mcp"],
+      "version": "0.2.27"
     }
   ]
 }

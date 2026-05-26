@@ -1511,6 +1511,40 @@ def _is_pipedream_block(block: dict) -> bool:
     return False
 
 
+def _block_has_silent_row_errors(block: dict) -> bool:
+    """v0.2.27: True if the block belongs to a category where block-level
+    status reports completed/error=null EVEN WHEN per-row failures happened.
+
+    Two known categories:
+      - Pipedream-wrapped actions (handled by _is_pipedream_block)
+      - nRev Tables action nodes (nrev_tables.add_row / update_row / etc.)
+
+    The 2026-05-26 prod test caught nrev_tables.add_row reporting
+    `status: completed` while every row had a `Cell type mismatch` error
+    in its `error` column. Same silent-failure pattern as Pipedream,
+    different origin type. v0.2.20 Fix F's helper missed this because it
+    only checked for Pipedream origins.
+
+    Detection: Pipedream check OR origin_node_type starts with `nrev_tables.`
+    """
+    if _is_pipedream_block(block):
+        return True
+    if not isinstance(block, dict):
+        return False
+    sfv = block.get("settings_field_values") or []
+    for entry in sfv:
+        fn = entry.get("field_name") or ""
+        if fn.startswith("nrev_tables-"):
+            return True
+    outs = block.get("outputs") or []
+    for out in outs:
+        for col in (out.get("columns_metadata") or []):
+            ont = col.get("origin_node_type") or ""
+            if ont.startswith("nrev_tables."):
+                return True
+    return False
+
+
 def _check_pipedream_row_error(workflow_id: str, execution_id: str,
                                 block_id: str) -> Optional[dict]:
     """Fetch the first output row of a Pipedream node and surface its error column.
@@ -1535,11 +1569,18 @@ def _check_pipedream_row_error(workflow_id: str, execution_id: str,
         return {"has_row_error": False, "row_error": None,
                 "error_attribution": None,
                 "_diagnostic": f"preview fetch failed: {type(e).__name__}: {str(e)[:200]}"}
-    # The API returns the rows under "entries" (full response shape) and the
-    # server tool surfaces them as "rows" — accept either.
+    # The platform's preview endpoint returns rows under "data" (verified
+    # against prod 2026-05-26). Earlier wrappers/tests used "entries" or
+    # "rows" — accept all three to cover the response-shape variants we've
+    # seen historically. v0.2.27: this fix is what makes Pipedream + nrev_tables
+    # silent row-level errors actually surface (the helper was failing closed
+    # on the real response shape).
     rows = None
     if isinstance(rows_resp, dict):
-        rows = rows_resp.get("entries") or rows_resp.get("rows") or []
+        rows = (rows_resp.get("data")
+                or rows_resp.get("entries")
+                or rows_resp.get("rows")
+                or [])
     if not rows:
         return {"has_row_error": False, "row_error": None, "error_attribution": None}
     row0 = rows[0] if isinstance(rows[0], dict) else {}
@@ -1603,7 +1644,9 @@ def _maybe_enrich_pipedream_errors(workflow_id: str, raw_execution: dict) -> dic
         if not block_id:
             continue
         block = blocks_by_id.get(block_id)
-        if not block or not _is_pipedream_block(block):
+        # v0.2.27: extend coverage to nrev_tables.* nodes via
+        # _block_has_silent_row_errors (was: _is_pipedream_block only).
+        if not block or not _block_has_silent_row_errors(block):
             continue
         chk = _check_pipedream_row_error(workflow_id, execution_id, block_id)
         if chk and chk.get("has_row_error"):
@@ -1712,7 +1755,8 @@ def check_node_errors(workflow_id: str, execution_id: str,
         if node_id and bid != node_id:
             continue  # filter to single block
         block = blocks_by_id.get(bid)
-        if not block or not _is_pipedream_block(block):
+        # v0.2.27: extend to nrev_tables.* nodes (same silent-row-error pattern)
+        if not block or not _block_has_silent_row_errors(block):
             skipped.append(bid)
             continue
         chk = _check_pipedream_row_error(workflow_id, execution_id, bid)
@@ -4670,6 +4714,54 @@ def attach_node(
     "what does this need?" preview — consult the catalog `value` slug
     and Pipedream's documented action schema instead.
 
+    NREV TABLES NODES (v0.2.27 — same `attach_node` works, but watch the shape):
+
+    Four typeIds for nrev_tables.* nodes; all share the field-name prefix
+    pattern `nrev_tables-<action>-*`:
+      - `a1b2c3d4-0003-4000-8000-000000000003` — Query Table (TRIGGER, read)
+      - `a1b2c3d4-0001-4000-8000-000000000001` — Add Row (action, write)
+      - `a1b2c3d4-0002-4000-8000-000000000002` — Update Row (action)
+      - `a1b2c3d4-0004-4000-8000-000000000004` — Get Row (TRIGGER, single)
+
+    The `column_values` field (Add Row) AND `fields_to_update`/`match_conditions`
+    (Update Row) use a LIST-OF-LISTS-OF-ENVELOPES shape — NOT a flat dict:
+
+      [                                          # outer list of column entries
+        [                                        # inner list per column
+          {"field_name": "column_id", "field_value": "<col_uuid>", "fieldLabel": "name"},
+          {"field_name": "value",     "field_value": "{{name}}"},
+        ],
+        [...],
+      ]
+
+    DO NOT use the shorter `[{"column_id": x, "value": y}]` shape — the
+    platform's "Invalid Add Row settings" error. The 2026-05-26 prod test
+    burned cycles on this. Stick to envelopes.
+
+    TEMPLATE SYNTAX: `{{column_name}}` — NOT `{{data.column_name}}`. The
+    `data.` prefix that works for Slack / Pipedream node templates does NOT
+    work for nrev_tables nodes. Just bare `{{name}}`, `{{score}}`, etc.
+
+    TEMPLATE TYPING GOTCHA: templated values always resolve to STRINGS. If
+    the target column is `number` or `boolean`, the platform rejects with
+    "Cell type mismatch: expected number, got str." Workaround: cast in an
+    upstream Magic Node before the Add Row:
+        df["score"] = df["score"].astype(int)
+    Then `{{score}}` flows as an int through the pipeline. Text columns
+    (`text`, `long_text`) work fine with raw templates.
+
+    COLUMN UUID DISCOVERY: don't call `tables_get()` — `get_node_dynamic_fields`
+    already returns the table's columns under `available_options[].options[]`
+    as `{label: "<column_name>", value: "<column_uuid>"}`. One round-trip.
+
+    SILENT ROW-LEVEL ERRORS: nrev_tables.add_row reports `status: completed,
+    error: null` at the block level even when every row failed at the cell
+    type-mismatch check (the failures live in `row[i].error`). v0.2.27
+    extended `check_node_errors` (and `tail_execution`'s auto-enrichment) to
+    detect nrev_tables nodes alongside Pipedream nodes — call
+    `check_node_errors(workflow_id, execution_id, node_id)` after any
+    nrev_tables.add_row / update_row to confirm.
+
     `field_labels` (optional): explicit {field_name: human_label} map. Useful
     when you already know the labels (e.g. copied from another node). Values
     here take precedence over auto-resolution.
@@ -6078,6 +6170,254 @@ def get_plugin_version() -> dict:
         "version": __version__,
         "name": "nrev-wf-mcp",
         "homepage": "https://github.com/nurturev-dev/nrev-workflow-mcp",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Monitoring — v0.2.27
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# One tool: find_workflows_using_resource. Each match already includes
+# the exact nodes that reference the resource (node_id, name, type, matched
+# field) — so a separate find_node_writing_to is redundant. The narrower
+# tools (daily_run_digest, workflow_change_log) were deliberately deferred
+# until a real use case proves they're needed beyond ad-hoc Python.
+
+
+# Static map of app keyword → set of typeIds and the field-name fragment that
+# carries the resource identifier. Used by find_workflows_using_resource.
+# Sourced from list_node_definitions probes (2026-05-25/26 on prod).
+_RESOURCE_APP_MAP: dict[str, dict] = {
+    "google_sheets": {
+        "type_ids": {
+            "fc3dcbe6-639c-427a-8b26-646fca374ea6": "Copy Worksheet",
+            "b220d182-d786-4ce7-b332-e2a824a86afc": "Add Multiple Rows",
+            "191db4a1-7c72-4c4a-af02-b507701ca61b": "Add Single Row",
+            "765dc56d-0d58-4375-bbbb-f9d96b0fe342": "Upsert Row",
+            "006fee09-e0ab-4113-b3d5-3c11050af403": "Clear Cell",
+            "5ec50b4b-5339-4142-aa33-1943f2940fe6": "Clear Rows",
+            "24679149-b632-463c-8048-16abf2f605f4": "Create Column",
+            "532cbc62-bedb-4b5b-9017-36c9de722012": "Create Worksheet",
+            "014a52e7-a184-4315-8eeb-3d3447d11e47": "Delete Rows",
+            "78662378-882c-4992-8d78-2fc469b2d6b4": "Delete Worksheet",
+            "cf9fd30d-8e20-43ee-9743-7006c4d6b384": "Find Row",
+            "f9912784-c4e3-447e-947e-0781ce385b08": "Get Cell",
+            "f7f400a4-0a9d-4220-98eb-16dc503f0b73": "Get Spreadsheet by ID",
+            "ce01c704-f6bd-40d5-9b2b-f545495de14b": "Get Values in Range",
+            "4372edf7-9a56-4a01-88d5-3aeb13e96804": "New Comment (Instant)",
+            "2655a0e4-a196-4110-807d-92c38ba54995": "New Row Added (poll)",
+            "305c822e-f6cb-4206-aba6-29933cc204de": "New Row Added (Instant)",
+            "1f6e0dfe-4c3b-41c1-992b-3d7d96583f1b": "New Updates (Instant)",
+            "14beff21-45a6-4334-92eb-3e306cb3f72e": "New Worksheet (Instant)",
+        },
+        "field_fragment": "sheetId",  # matches *-sheetId field-name suffix
+    },
+    "slack": {
+        # Common Slack v2 actions — channel id stored in *-conversation or *-channel
+        "type_ids": {
+            "a0c60b77-fda7-42a2-aac9-850051c6855b": "Send Message",
+            "a764c804-9627-4139-9a8c-e98f7e43e2b3": "Send Message to Channel",
+            "c297684a-fc40-4ae6-9577-f435f955273b": "Send Message (Advanced)",
+            "d71db55b-977f-427e-9d51-09958e353c3f": "Send Block Kit Message",
+            "ebf00cff-919d-4af6-911c-f18bae142414": "Send Large Message",
+            "0ff55964-b485-4ceb-b37c-61129713526c": "Find Message",
+        },
+        "field_fragment": "conversation",  # matches *-conversation, *-channel
+    },
+    "nrev_tables": {
+        "type_ids": {
+            "a1b2c3d4-0003-4000-8000-000000000003": "Query Table",
+            "a1b2c3d4-0001-4000-8000-000000000001": "Add Row",
+            "a1b2c3d4-0002-4000-8000-000000000002": "Update Row",
+            "a1b2c3d4-0004-4000-8000-000000000004": "Get Row",
+        },
+        "field_fragment": "table_id",
+    },
+}
+
+
+def _settings_contain_value(settings, target_value: str,
+                              key_fragment: Optional[str] = None) -> list[dict]:
+    """Walk nested settings_field_values recursively looking for target_value.
+    `key_fragment`: substring to match in field_name (e.g. 'sheetId')."""
+    if not isinstance(settings, list):
+        return []
+    hits: list[dict] = []
+    for s in settings:
+        if not isinstance(s, dict):
+            continue
+        fn = s.get("field_name", "")
+        fv = s.get("field_value")
+        if isinstance(fv, list):
+            hits.extend(_settings_contain_value(fv, target_value, key_fragment))
+        elif fv == target_value:
+            if not key_fragment or key_fragment in fn:
+                hits.append({"field_name": fn, "value": fv})
+    return hits
+
+
+@mcp.tool()
+def find_workflows_using_resource(
+    app: str,
+    resource_id: str,
+    active_within_days: int = 30,
+    max_workflows: int = 5000,
+) -> dict:
+    """Find every workflow that references a specific external resource
+    (Google Sheet id, Slack channel id, nRev table id, etc.).
+
+    `app`: one of `google_sheets`, `slack`, `nrev_tables` (extensible — see
+    `_RESOURCE_APP_MAP` in source). Determines the set of typeIds we scan
+    and the field-name fragment we match on.
+
+    `resource_id`: the EXACT string stored in the node's settings — for
+    Sheets this is the spreadsheet id (e.g. '1_k71sm0X8...'), for Slack
+    the channel id ('C0B64N2JTCY'), for nRev tables the table UUID.
+
+    `active_within_days`: scan only workflows whose `lastRunAt` is within
+    this window. Default 30 days = ~120 workflows on a typical tenant =
+    ~4-second scan. Pass `active_within_days=0` (or a huge value) to scan
+    every workflow including stale ones — that's ~80s on a 2k-workflow
+    tenant (verified 2026-05-26 prod).
+
+    Returns a dict:
+    ```
+    {
+      "matches": [
+        {
+          "workflow_id": "<wf_id>",
+          "workflow_name": "...",
+          "workflow_last_run_at": "...",
+          "matching_nodes": [
+            {"node_id": "...", "node_name": "...",
+             "type": "Add Single Row", "matched_field": "...-sheetId"},
+            ...
+          ]
+        },
+        ...
+      ],
+      "scan_meta": {
+        "app": "google_sheets", "resource_id": "...",
+        "workflows_scanned": N, "workflows_skipped_stale": N,
+        "matches_count": N, "scan_duration_seconds": float,
+      }
+    }
+    ```
+
+    The output already pinpoints the exact nodes — no separate
+    `find_node_writing_to` tool needed for the within-workflow drill-down.
+
+    PERFORMANCE: parallel-fetches workflows with concurrency 30. ~30ms per
+    workflow (one `get_workflow` call each — settings are embedded). On a
+    2k-workflow tenant, ~80s with no filter. With `active_within_days=30`
+    default, ~4s. Cap at `max_workflows` for safety (default 5000).
+    """
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    app_spec = _RESOURCE_APP_MAP.get(app)
+    if not app_spec:
+        return {
+            "matches": [],
+            "scan_meta": {
+                "app": app, "resource_id": resource_id,
+                "error": f"Unknown app '{app}'. Known: {sorted(_RESOURCE_APP_MAP.keys())}.",
+            },
+        }
+
+    target_type_ids = app_spec["type_ids"]
+    field_fragment = app_spec["field_fragment"]
+
+    t0 = _time.time()
+
+    # 1. List ALL workflows (paginate)
+    all_wfs: list[dict] = []
+    skip = 0
+    while True:
+        r = api.list_workflows(limit=100, offset=skip)
+        batch = r.get("data") or []
+        all_wfs.extend(batch)
+        if len(batch) < 100:
+            break
+        skip += 100
+        if len(all_wfs) >= max_workflows:
+            all_wfs = all_wfs[:max_workflows]
+            break
+
+    # 2. Active-window filter
+    skipped_stale = 0
+    if active_within_days and active_within_days > 0:
+        cutoff = _dt.now(_tz.utc) - _td(days=int(active_within_days))
+        kept = []
+        for w in all_wfs:
+            lr = w.get("lastRunAt") or w.get("last_run_at")
+            if not lr:
+                skipped_stale += 1
+                continue
+            try:
+                lr_dt = _dt.fromisoformat(lr.replace("Z", "+00:00"))
+                if lr_dt >= cutoff:
+                    kept.append(w)
+                else:
+                    skipped_stale += 1
+            except Exception:
+                skipped_stale += 1
+        all_wfs = kept
+
+    # 3. Parallel scan
+    def _scan(wf_summary: dict) -> Optional[dict]:
+        wf_id = wf_summary["id"]
+        try:
+            wf = api.get_workflow(wf_id)
+        except Exception:
+            return None
+        matches: list[dict] = []
+        for block in (wf.get("blocks") or []):
+            tid = block.get("typeId")
+            if tid not in target_type_ids:
+                continue
+            hits = _settings_contain_value(
+                block.get("settings_field_values"),
+                resource_id,
+                key_fragment=field_fragment,
+            )
+            if hits:
+                matches.append({
+                    "node_id": block["id"],
+                    "node_name": block.get("variableName"),
+                    "type": target_type_ids[tid],
+                    "matched_field": hits[0]["field_name"],
+                })
+        if matches:
+            return {
+                "workflow_id": wf_id,
+                "workflow_name": wf.get("name"),
+                "workflow_last_run_at": wf_summary.get("lastRunAt")
+                                         or wf_summary.get("last_run_at"),
+                "matching_nodes": matches,
+            }
+        return None
+
+    matches: list[dict] = []
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        futures = [ex.submit(_scan, w) for w in all_wfs]
+        for fut in as_completed(futures):
+            r = fut.result()
+            if r:
+                matches.append(r)
+
+    return {
+        "matches": matches,
+        "scan_meta": {
+            "app": app,
+            "resource_id": resource_id,
+            "active_within_days": active_within_days,
+            "workflows_scanned": len(all_wfs),
+            "workflows_skipped_stale": skipped_stale,
+            "matches_count": len(matches),
+            "scan_duration_seconds": round(_time.time() - t0, 2),
+        },
     }
 
 

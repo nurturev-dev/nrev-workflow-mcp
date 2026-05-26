@@ -226,6 +226,42 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
 
+### v0.2.27 — nrev_tables workflow nodes properly supported + 1 monitoring tool
+**The "lean: 1 new tool, real bug fixes" release.** A live prod test of attaching nrev_tables.add_row via the existing `attach_node` surfaced three bugs. Plus the monitoring use case got 1 tool (not 4 — the others were premature).
+
+**Fix #1 — row-level error detection covers nrev_tables nodes**
+
+`nrev_tables.add_row` (and `.update_row`, `.get_row`) have the same silent-failure pattern Pipedream nodes have: block-level `status: completed, error: null` while every row failed at the platform's cell type-mismatch check. v0.2.20 Fix F's helper only detected Pipedream origins; v0.2.27 extends it via a new `_block_has_silent_row_errors()` helper that covers both. Now `check_node_errors` and `tail_execution`'s auto-enrichment catch nrev_tables failures.
+
+**Fix #2 — `_check_pipedream_row_error` actually works against real prod responses**
+
+Pre-existing bug found during v0.2.27 verification: the helper looked for rows under `entries` or `rows` keys, but the real platform response uses `data`. The helper was silently returning "no error" for every real execution since v0.2.20. Now accepts all three response shapes. **Every Pipedream + nrev_tables row-level check is fixed by this** — not just nrev_tables.
+
+**Fix #3 — `attach_node` docstring: nRev Tables nodes section**
+
+The 2026-05-26 prod test burned cycles discovering 3 nrev_tables gotchas the hard way. Documented in the docstring so the next agent doesn't:
+- `column_values` / `fields_to_update` use a list-of-lists-of-envelopes shape, not flat dicts
+- Template syntax is `{{column_name}}`, NOT `{{data.column_name}}`
+- Templates always produce STRINGS — cast in an upstream Magic Node for `number` / `boolean` columns
+- Use `get_node_dynamic_fields`'s `available_options` to discover column UUIDs (no separate `tables_get` call needed)
+
+**New tool: `find_workflows_using_resource(app, resource_id, active_within_days=30)`**
+
+The only monitoring tool greenlit (`find_node_writing_to`, `daily_run_digest`, `workflow_change_log` deferred until a real use case proves them).
+
+Each match already includes the matching nodes (id, name, type, matched field), so `find_node_writing_to` is folded in. Parallel scan with `active_within_days=30` default = ~4s on a 2k-workflow tenant. Pass `0` to scan everything (~80s). Supports `google_sheets`, `slack`, `nrev_tables`; extensible via `_RESOURCE_APP_MAP`.
+
+Live verified on prod: finds 8 workflows using a specific Sheet across 2178 total workflows.
+
+**What I REJECTED for v0.2.27** (after critical assessment):
+- Per-node helper tools for `nrev_tables.*` (`attach_table_read` etc.) — `attach_node` already handles them once the docs are right. No new tools justified.
+- `find_node_writing_to` — covered by `find_workflows_using_resource`'s embedded node info.
+- `daily_run_digest` and `workflow_change_log` — defer until a real use case proves them.
+
+Tool count: 75 → 76 (+1 monitoring). Tests: 327 → 341 (+14 in `test_v0_2_27_fixes.py`).
+
+No breaking changes.
+
 ### v0.2.26 — nRev Tables integration (19 new tools + version helper)
 **The "tables ships" release.** nRev Tables landed on prod 2026-05-25; this release wraps the full 15-endpoint surface in 19 ergonomic MCP tools.
 
