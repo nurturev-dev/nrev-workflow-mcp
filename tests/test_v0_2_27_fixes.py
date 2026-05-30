@@ -168,7 +168,13 @@ def test_resource_app_map_covers_known_apps():
     assert "nrev_tables" in _RESOURCE_APP_MAP
     for app, spec in _RESOURCE_APP_MAP.items():
         assert "type_ids" in spec and isinstance(spec["type_ids"], dict)
-        assert "field_fragment" in spec and isinstance(spec["field_fragment"], str)
+        # v0.2.28: field_fragment may be str OR tuple/list of str (Slack uses
+        # ("conversation", "channel") because field naming is inconsistent).
+        assert "field_fragment" in spec
+        ff = spec["field_fragment"]
+        assert isinstance(ff, (str, tuple, list))
+        if isinstance(ff, (tuple, list)):
+            assert all(isinstance(x, str) for x in ff)
         assert len(spec["type_ids"]) >= 1
 
 

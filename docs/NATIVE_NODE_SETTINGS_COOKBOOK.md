@@ -58,6 +58,28 @@ hyphens. If the upstream Input Form uses `Linkedin URL` as the column label,
 template references like `{{Linkedin URL}}` will not resolve. Rename the
 Input Form column to `linkedin_url` upstream.
 
+**Templates are validated at attach-time, not runtime.** If the parent
+node's `outputs.columns_metadata` does not yet declare a column matching
+your template, the platform returns `"Fields not found in available data:
+<name>"` and the new node is marked unrunable. This bites most often when:
+
+- The parent is a node that declares columns only after first execution
+  (Search People, Get Person Profile, most LinkedIn Scraping nodes). Work
+  around it by running the parent once via `partial_execute` so it declares
+  its outputs, then attach the downstream node.
+- You attached the parent without setting `output_columns` on a Custom Code /
+  Magic Node — the platform has no idea what columns will exist. Pass
+  `output_columns=[...]` to `attach_node` / `attach_magic_node` to declare
+  them statically.
+- v0.2.28 attach_node Fix #3 re-PUTs the new node once if it sees this
+  error, which can paper over input-cache lag — look for
+  `input_refresh_recovered:True` in the response. If still failing after
+  that, the column truly doesn't exist upstream.
+
+**Templates always resolve to STRINGS.** A target column typed as `number`
+or `boolean` will reject with "Cell type mismatch". Cast upstream in a
+Magic Node: `df["score"] = df["score"].astype(int)`.
+
 ---
 
 ## LinkedIn Scraping
@@ -66,15 +88,29 @@ Input Form column to `linkedin_url` upstream.
 
 | Property | Value |
 |---|---|
-| typeId | `4e5005c4-86fa-46d6-8e76-13f0cbcd5d76` |
+| typeId | `4e5005c4-b1a5-417b-af59-453b86f489db` |
 | Shape | A (flat) |
-| Category | LinkedIn Scraping |
+| Category | Linkedin Scraping *(lowercase k — matches the catalog string exactly; `category="LinkedIn Scraping"` returns 0 results from `list_node_definitions`)* |
+| is_trigger? | **NO** — action node, MUST have a parent that supplies the `linkedin_url` column |
 
 ```python
 settings = {
     "linkedin_scraping-get_person_profile-linkedin_url": "{{linkedin_url}}",
 }
 ```
+
+**One-off pattern**: since this can't be a workflow root, the canonical
+one-off shape is `Search People` (root) → `Get Person Profile`, or a CSV /
+Sheets Read (root) supplying a `linkedin_url` column → `Get Person Profile`.
+
+**Template gotcha (verified live 2026-05-30)**: `{{linkedin_url}}` is
+validated at attach-time against the upstream's known columns. If the
+parent's `outputs.columns_metadata` doesn't yet include `linkedin_url` —
+e.g., a Search People node that hasn't executed and therefore hasn't
+declared its output schema yet — the platform returns `"Fields not found in
+available data: linkedin_url"` even though the template is syntactically
+correct. v0.2.28's `attach_node` defensive retry (Fix #3) re-PUTs the node
+to force a refresh; check `input_refresh_recovered:True` in the response.
 
 **Output columns** (declared after first execution; check via `get_node` on a
 run workflow for exact set): includes `linkedin_url`, `headline`, `about`,
@@ -85,9 +121,10 @@ run workflow for exact set): includes `linkedin_url`, `headline`, `about`,
 
 | Property | Value |
 |---|---|
-| typeId | `cf30b3d8-3a90-4f70-bca6-2c0c87bd4ada` |
+| typeId | `c854f6d7-f44d-470f-8e9c-f3c42a24a888` |
 | Shape | A (flat) |
-| Category | LinkedIn Scraping |
+| Category | Linkedin Scraping |
+| is_trigger? | YES — can be a workflow root |
 
 ```python
 settings = {
@@ -99,13 +136,18 @@ settings = {
 
 ## People Data
 
-### Enrich People (RocketReach / paid DB enrichment)
+### Enrich People (paid DB enrichment)
 
 | Property | Value |
 |---|---|
-| typeId | `6439527f-9aaf-441a-9c5c-7d9e5c7e3d96` |
+| typeId | `6439527f-abe7-44e5-b462-60e1a45be619` |
 | Shape | **B (reference-group envelope)** |
 | Category | People Data |
+| is_trigger? | NO — needs a parent supplying the reference column |
+
+**Alternative**: `RocketReach: Enrich People` is a separate node with typeId
+`43ae6689-b0f2-44bc-b34a-970ec02dedd2` (is_trigger=True, can be root).
+Same `person_reference` envelope.
 
 ```python
 settings = {
@@ -138,21 +180,27 @@ for downstream column-mapping; keep the list short.
 | Property | Value |
 |---|---|
 | typeId | `15145759-901a-4a87-8db3-84cd9e734a49` |
-| Shape | A (flat fields, many) |
+| Shape | **B (reference-group envelope)** |
 | Category | People Data |
+| is_trigger? | YES — can be a workflow root |
 
 ```python
 settings = {
     "people_data-search_people-person_reference": [
+        # Must include at least one search criterion — name alone is too
+        # loose; combine with title/company/organization. Validated live
+        # 2026-05-30: passing only `name` returns
+        # "At least one search criteria field must be provided".
         {"field_name": "name", "field_value": "Alice Example"},
+        {"field_name": "organization_name", "field_value": "Acme Corp"},
     ],
     "people_data-search_people-per_page": 1,  # cap to control cost
 }
 ```
 
-The 2026-05-25 session showed Search People accepts the same `person_reference`
-envelope as Enrich People — Shape B works here too despite being a "search"
-node.
+**Alternative**: `RocketReach: Search People` is a separate node with typeId
+`99631757-7b8a-4fc9-9733-b47d5702d9b2` (different filter fields, same
+envelope shape).
 
 ---
 
@@ -162,9 +210,10 @@ node.
 
 | Property | Value |
 |---|---|
-| typeId | `91ec0d74-...` (verify via `list_node_definitions(search="enrich company")`) |
+| typeId | `1e908fa8-d63b-4a67-bb58-004dc15052e2` |
 | Shape | **B (reference-group envelope)** |
 | Category | Company Data |
+| is_trigger? | NO — needs a parent supplying the reference column |
 
 ```python
 settings = {
@@ -176,13 +225,17 @@ settings = {
 }
 ```
 
+**Alternative**: `RocketReach: Enrich Company` is a separate node with typeId
+`119be39f-278e-46fd-a0b9-15bc81eb85cb` (is_trigger=True). Same envelope.
+
 ### Fetch Jobs
 
 | Property | Value |
 |---|---|
-| typeId | (verify via `list_node_definitions(search="fetch jobs")`) |
+| typeId | `d78f7f27-3759-4590-a6a7-525dbda774b1` |
 | Shape | **B (reference-group envelope; uses `company_details` not `company_reference`)** |
 | Category | Company Data |
+| is_trigger? | NO |
 
 ```python
 settings = {
@@ -324,6 +377,89 @@ matching typeIds. The catalog `value` slug tells you which family the node
 belongs to (e.g. `linkedin_scraping.get_person_profile`,
 `company_data.enrich_company`). That family name is the **prefix** before the
 first hyphen in every settings field for that node.
+
+---
+
+---
+
+## Pipedream Google Sheets — the sheetId/worksheetId trap
+
+`pipedream.google_sheets.*` actions are Pipedream nodes, not native, but they
+have a UX trap worth documenting alongside the native cookbook because agents
+hit it constantly.
+
+### `sheetId` is the SPREADSHEET URL ID — not the sheet name
+
+The field name is misleading. `sheetId` stores the spreadsheet's URL ID
+(the long string after `/d/` in a sheets.google.com URL), NOT the human-
+friendly name of the workbook.
+
+```python
+# ❌ WRONG — agent passed the sheet NAME, not the ID
+settings = {
+    "pipedream-google_sheets-google_sheets_get_values_in_range-sheetId": "MCP Testing",
+}
+# Platform error: cannot find spreadsheet
+
+# ✅ CORRECT — pass the URL ID
+settings = {
+    "pipedream-google_sheets-google_sheets_get_values_in_range-sheetId":
+        "1_k71sm0X8Cb5mo_5M7nuPvn6vv24qYxH_1UxU4TfrIQ",
+}
+```
+
+**Finding the ID**: open the sheet in a browser. URL looks like
+`https://docs.google.com/spreadsheets/d/<ID>/edit#gid=<TAB>`. Copy the
+`<ID>`. Or use the MCP — `list_field_options(field_name="...-sheetId")` 
+returns all spreadsheets accessible to the connection as
+`[{label: "Workbook Name", value: "<id>"}, ...]`.
+
+v0.2.28: `attach_node` emits a `pipedream_field_warnings` entry when a
+`*-sheetId` value doesn't look like a Google ID (e.g. has spaces, < 30 chars).
+The warning has the canonical example + the `list_field_options` pointer.
+
+### `worksheetId` is the TAB's NUMERIC ID — not the tab name
+
+Same trap, different field. `worksheetId` is the tab's numeric `gid` (visible
+in the URL after `#gid=`), NOT the display name like "Sheet1" or "Leads".
+
+```python
+# ❌ WRONG — tab name
+settings = {
+    "pipedream-google_sheets-google_sheets_get_values_in_range-worksheetId": "Leads",
+}
+
+# ✅ CORRECT — numeric tab ID
+settings = {
+    "pipedream-google_sheets-google_sheets_get_values_in_range-worksheetId": "101353668",
+}
+```
+
+Same v0.2.28 warning emits for non-numeric `*-worksheetId` values.
+
+### Canonical Get Values in Range example
+
+```python
+settings = {
+    "pipedream-google_sheets-google_sheets_get_values_in_range-googleSheets_connection_id":
+        "<connection_id>",                   # use list_connections to find
+    "pipedream-google_sheets-google_sheets_get_values_in_range-drive":
+        "My Drive",                          # or a shared drive name
+    "pipedream-google_sheets-google_sheets_get_values_in_range-sheetId":
+        "<spreadsheet URL ID>",
+    "pipedream-google_sheets-google_sheets_get_values_in_range-worksheetId":
+        "<numeric tab gid>",
+    "pipedream-google_sheets-google_sheets_get_values_in_range-range":
+        "A1:E100",                           # A1 notation; required
+}
+```
+
+### Add Single Row / Add Multiple Rows / Upsert Row / Update/Upsert Row
+
+Same `sheetId` + `worksheetId` trap. Plus row values come from the upstream
+block's columns (the platform reads upstream column NAMES + matches to sheet
+headers when `hasHeaders=true`). Don't try to specify row values directly in
+`settings` — they get silently ignored.
 
 ---
 

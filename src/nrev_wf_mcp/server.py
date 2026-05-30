@@ -604,6 +604,47 @@ def _looks_like_edge_id(s: str) -> bool:
     return any(f"-df{i}" in s for i in range(1, 10))
 
 
+def _looks_like_google_sheet_id(s: str) -> bool:
+    """Google Spreadsheet IDs are URL slugs: 30+ chars of [A-Za-z0-9_-],
+    no spaces. Real examples are typically 44 chars and start with '1'.
+
+    v0.2.28: used to flag the common agent confusion where a friendly sheet
+    name ("MCP Testing") gets passed instead of the actual URL ID. Lenient
+    floor of 30 chars to allow for legitimate IDs that don't start with '1'
+    (rare but possible) while catching obvious human-name strings.
+
+    Also accepts templated values starting with '{{' — those are upstream
+    references and unknowable until execution.
+    """
+    if not isinstance(s, str) or not s:
+        return False
+    if s.startswith("{{"):
+        return True  # Template — punt to runtime
+    if " " in s:
+        return False  # Sheet IDs have no spaces; names usually do
+    # 30+ alphanumeric+_- chars only
+    if len(s) < 30:
+        return False
+    return all(c.isalnum() or c in "-_" for c in s)
+
+
+def _looks_like_worksheet_id(s) -> bool:
+    """Google Worksheet (tab) IDs are integers (often called sheet gid).
+    Pipedream surfaces them as strings of digits.
+
+    v0.2.28: used to flag the common agent confusion where the tab's
+    display name ("Sheet1", "Leads") gets passed instead of the numeric ID.
+    Accepts templated values and integers/digit strings.
+    """
+    if isinstance(s, int):
+        return True
+    if not isinstance(s, str) or not s:
+        return False
+    if s.startswith("{{"):
+        return True  # Template
+    return s.lstrip("-").isdigit()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Sandbox lint (standalone)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5169,6 +5210,45 @@ def attach_node(
         except Exception:
             pass
 
+    # v0.2.28 — Sheets sheetId / worksheetId shape check.
+    # Google Spreadsheet IDs are ~44-char alphanumeric (with `-` and `_`)
+    # strings, typically starting with "1". Agents commonly confuse the
+    # field NAME (`sheetId`) for "sheet name" and pass the human-friendly
+    # workbook title like "MCP Testing" instead of the actual ID. The
+    # platform error is confusing ("Spreadsheet not found"), and the field
+    # NAME doesn't help. Emit a loud warning when a *-sheetId field gets
+    # a value that looks like a free-text name.
+    for fname, fvalue in settings.items():
+        if not isinstance(fvalue, str):
+            continue
+        if fname.endswith("-sheetId") and not _looks_like_google_sheet_id(fvalue):
+            pipedream_field_warnings.append({
+                "field_name": fname,
+                "issue": (
+                    f"value {fvalue!r} doesn't look like a Google Spreadsheet ID "
+                    f"(expected ~44-char alphanumeric, typically starting with '1'). "
+                    f"This field stores the spreadsheet's URL ID, not its human "
+                    f"name. Find IDs in the sheet URL after '/d/...' OR call "
+                    f"list_field_options(field_name='{fname}') to see "
+                    f"{{label: name, value: id}} pairs."
+                ),
+                "looks_like": "human-readable sheet name (free text)",
+                "expected": "google spreadsheet ID, e.g. '1_k71sm0X8Cb5mo_5M7nuPvn6vv24qYxH_1UxU4TfrIQ'",
+            })
+        elif fname.endswith("-worksheetId") and not _looks_like_worksheet_id(fvalue):
+            pipedream_field_warnings.append({
+                "field_name": fname,
+                "issue": (
+                    f"value {fvalue!r} doesn't look like a Google Worksheet (tab) ID "
+                    f"(expected an integer). This field stores the worksheet's "
+                    f"numeric ID, not the tab's display name. Call "
+                    f"list_field_options(field_name='{fname}') to see "
+                    f"{{label: tab name, value: id}} pairs once sheetId is set."
+                ),
+                "looks_like": "human-readable worksheet/tab name",
+                "expected": "integer worksheet ID, e.g. '101353668'",
+            })
+
     # v0.2.28 Fix #1 + Fix #3 — flip `ok` based on post-attach validation, AND
     # attempt one defensive retry for the "Fields not found in available data"
     # pattern (where v0.2.23's _build_inputs_from_parents didn't fire for the
@@ -6343,6 +6423,10 @@ def get_plugin_version() -> dict:
 # Sourced from list_node_definitions probes (2026-05-25/26 on prod).
 _RESOURCE_APP_MAP: dict[str, dict] = {
     "google_sheets": {
+        # All 22 typeIds in pipedream.google_sheets.* (re-audited 2026-05-30
+        # after a colleague's scan missed Update Cell + Update/Upsert Row).
+        # If you add a new Sheets node type to the catalog, add it here too
+        # or find_workflows_using_resource will silently miss it.
         "type_ids": {
             "fc3dcbe6-639c-427a-8b26-646fca374ea6": "Copy Worksheet",
             "b220d182-d786-4ce7-b332-e2a824a86afc": "Add Multiple Rows",
@@ -6351,6 +6435,7 @@ _RESOURCE_APP_MAP: dict[str, dict] = {
             "006fee09-e0ab-4113-b3d5-3c11050af403": "Clear Cell",
             "5ec50b4b-5339-4142-aa33-1943f2940fe6": "Clear Rows",
             "24679149-b632-463c-8048-16abf2f605f4": "Create Column",
+            "5c4d12a3-8874-45e7-9dec-1196e3032ee7": "Create Spreadsheet",  # v0.2.28
             "532cbc62-bedb-4b5b-9017-36c9de722012": "Create Worksheet",
             "014a52e7-a184-4315-8eeb-3d3447d11e47": "Delete Rows",
             "78662378-882c-4992-8d78-2fc469b2d6b4": "Delete Worksheet",
@@ -6363,11 +6448,15 @@ _RESOURCE_APP_MAP: dict[str, dict] = {
             "305c822e-f6cb-4206-aba6-29933cc204de": "New Row Added (Instant)",
             "1f6e0dfe-4c3b-41c1-992b-3d7d96583f1b": "New Updates (Instant)",
             "14beff21-45a6-4334-92eb-3e306cb3f72e": "New Worksheet (Instant)",
+            "59c89f54-9b1f-4f93-a158-d1552658d222": "Update Cell",  # v0.2.28
+            "3df67eff-0724-4e43-b43e-681a6f01ea1f": "Update/Upsert Row",  # v0.2.28
         },
         "field_fragment": "sheetId",  # matches *-sheetId field-name suffix
     },
     "slack": {
-        # Common Slack v2 actions — channel id stored in *-conversation or *-channel
+        # Channel-bound Slack v2 actions only (expanded 2026-05-30). Skipping
+        # workspace-scoped actions (list_users, find_user_by_email, etc.) that
+        # don't reference a specific channel/conversation.
         "type_ids": {
             "a0c60b77-fda7-42a2-aac9-850051c6855b": "Send Message",
             "a764c804-9627-4139-9a8c-e98f7e43e2b3": "Send Message to Channel",
@@ -6375,8 +6464,25 @@ _RESOURCE_APP_MAP: dict[str, dict] = {
             "d71db55b-977f-427e-9d51-09958e353c3f": "Send Block Kit Message",
             "ebf00cff-919d-4af6-911c-f18bae142414": "Send Large Message",
             "0ff55964-b485-4ceb-b37c-61129713526c": "Find Message",
+            "ca1af997-c203-49c2-bfe7-8841987b1d7a": "Reply to a Message Thread",  # v0.2.28
+            "35af9d58-b281-4b39-9ef0-752cee3d4f84": "List Replies",  # v0.2.28
+            "ced347a3-b6f3-40b8-970b-59ccca6c23f2": "Delete Message",  # v0.2.28
+            "f2767b0f-6fb3-4249-bd09-6be21585773a": "Add Emoji Reaction",  # v0.2.28
+            "01d7cd8d-ada0-44c8-9f00-eaf9bdea96ca": "Archive Channel",  # v0.2.28
+            "ffe7471d-16a5-465f-8428-cb2226f3eecb": "Invite User to Channel",  # v0.2.28
+            "35492dc2-8477-4120-9eda-5f62e070752e": "Kick User",  # v0.2.28
+            "551760a5-11c2-4dea-8f89-04864f60aa59": "List Members in Channel",  # v0.2.28
+            "92c7425d-cb3e-4459-bfc9-bb71c7a492ed": "Approve Workflow",  # v0.2.28
+            # Listeners (channel-scoped):
+            "8e6110dd-979a-4f73-9815-0bcbe31d7cb3": "New Message In Channels (Instant)",  # v0.2.28
+            "883207bb-6fdf-4719-9731-e0581531739d": "New Keyword Mention (Instant)",  # v0.2.28
+            "b0020b7d-7d41-4a1c-8395-6e7d41fdac1b": "New User Mention (Instant)",  # v0.2.28
+            "a5fa0c1e-b7b6-4c8e-a5c4-94ac0730d3c4": "New Reaction Added (Instant)",  # v0.2.28
         },
-        "field_fragment": "conversation",  # matches *-conversation, *-channel
+        # v0.2.28: Slack field naming is inconsistent. Send Message uses
+        # `-conversation`; some listeners use `-conversations` (plural); some
+        # actions use `-channel` / `-channel_id`. Match any of these.
+        "field_fragment": ("conversation", "channel"),
     },
     "nrev_tables": {
         "type_ids": {
@@ -6391,11 +6497,23 @@ _RESOURCE_APP_MAP: dict[str, dict] = {
 
 
 def _settings_contain_value(settings, target_value: str,
-                              key_fragment: Optional[str] = None) -> list[dict]:
+                              key_fragment=None) -> list[dict]:
     """Walk nested settings_field_values recursively looking for target_value.
-    `key_fragment`: substring to match in field_name (e.g. 'sheetId')."""
+
+    `key_fragment`: substring(s) to match in field_name. Accepts:
+      - str: single substring (legacy)
+      - tuple/list: any matching substring counts as a hit (v0.2.28)
+      - None: match value regardless of field_name
+
+    v0.2.28 widened to multi-pattern after a colleague's scan missed Slack
+    nodes that use `-channel` field names instead of `-conversation`.
+    """
     if not isinstance(settings, list):
         return []
+    fragments = (
+        (key_fragment,) if isinstance(key_fragment, str)
+        else tuple(key_fragment) if key_fragment else ()
+    )
     hits: list[dict] = []
     for s in settings:
         if not isinstance(s, dict):
@@ -6405,7 +6523,7 @@ def _settings_contain_value(settings, target_value: str,
         if isinstance(fv, list):
             hits.extend(_settings_contain_value(fv, target_value, key_fragment))
         elif fv == target_value:
-            if not key_fragment or key_fragment in fn:
+            if not fragments or any(frag in fn for frag in fragments):
                 hits.append({"field_name": fn, "value": fv})
     return hits
 
