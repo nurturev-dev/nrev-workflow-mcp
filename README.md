@@ -220,11 +220,34 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 **Tool calls return HTTP 4xx** — JWT is invalid or expired. Get a fresh one.
 
+**Building a workflow and stuck on settings for a "native" node** (Get Person Profile, Enrich Company, Classifier, etc.) — `get_node_dynamic_fields` is **Pipedream-only**; it returns structured guidance with HTTP 500 wrap for native nodes. Consult `docs/NATIVE_NODE_SETTINGS_COOKBOOK.md` first for the canonical settings dict per node.
+
+**`ToolSearch(select:...)` returns "No matching deferred tools found"** — the deferred-tool names use the full MCP namespace: `mcp__nrev-wf__<tool_name>`. Use `ToolSearch(select:mcp__nrev-wf__set_jwt)` not `ToolSearch(select:set_jwt)`.
+
 ---
 
 ## Release notes
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
+
+### v0.2.28 — friction-killers from a real customer session (no new tools)
+**The "stop the agent getting stuck" release.** A 2026-05-29 session ("nRev workflow with nrev-wf") was forensically analyzed: agent built only 3 of ~12 planned nodes before abandoning. Root causes: (a) no documented way to discover native-node settings, (b) `ok:true` returned for nodes with hidden `node_config_error`, (c) raw HTTP 500s for native nodes on `get_node_dynamic_fields`, (d) "Missing a field" errors with no hint about the reference-group envelope pattern, (e) v0.2.23's input-refresh fix not firing for `linkedin_scraping.*` typeIds.
+
+**Fix #1 — `attach_node.ok` reflects post-attach validation.** Pre-fix, paste succeeding with no error returned `ok: true` even when post-attach `validate_workflow` found a `node_config_error` on the new block. Agents read `ok: true` and moved on. Now `ok` flips to `False` if validation finds a node-level error.
+
+**Fix #2 — `get_node_dynamic_fields` catches native-node HTTP 500.** Pre-fix, calling this Pipedream-only endpoint on a native typeId raised a raw HTTP 500. Now returns a structured `{ok: false, error_kind: "native_or_unsupported", raw_error, guidance}` response pointing at the cookbook.
+
+**Fix #3 — `attach_node` defensive input-refresh retry.** v0.2.23's `_build_inputs_from_parents` didn't fire for `linkedin_scraping.*` typeIds in the 2026-05-29 session — agent saw `"Fields not found in available data: linkedin_url"` despite the parent having that column. Now `attach_node` detects this pattern post-attach and re-PUTs the node once to force input refresh. Response surfaces `input_refresh_recovered: True` so the agent knows a defensive fix fired.
+
+**Fix #4 — `update_node_setting` injects `hint` on "Missing a field" errors.** When the platform returns `"Whoops! Missing a field - <name>"` (the canonical signal for the reference-group envelope shape vs flat-field shape mismatch), the response now includes a `hint` field pointing at the cookbook for the per-node envelope shape.
+
+**NEW DOC — `docs/NATIVE_NODE_SETTINGS_COOKBOOK.md`.** The load-bearing fix. Canonical settings dicts for the most-used native nodes: Get Person Profile, Get Post by Person, Enrich People, Search People, Enrich Company, Fetch Jobs, all 4 nrev_tables nodes. Per node: typeId, shape (flat vs envelope), example settings dict, declared output columns, template-syntax callout, type-coercion gotcha.
+
+**Docstring updates** — `attach_node` promotes "TEMPLATE SYNTAX" + "REFERENCE-GROUP ENVELOPE SHAPE" to top-level sections (out of nrev_tables-only). `get_node_dynamic_fields` opens with "⚠️ PIPEDREAM ACTIONS ONLY" + native-node guidance. `validate_workflow` documents the v0.2.28 input-cache-lag workaround. README adds troubleshooting entries for the `ToolSearch(select:mcp__nrev-wf__*)` namespace pattern + native-node settings discovery.
+
+**Tool count: 76 → 76 (no new tools).** Tests: 341 → 353 (+12 in `test_v0_2_28_fixes.py`).
+
+No breaking changes.
 
 ### v0.2.27 — nrev_tables workflow nodes properly supported + 1 monitoring tool
 **The "lean: 1 new tool, real bug fixes" release.** A live prod test of attaching nrev_tables.add_row via the existing `attach_node` surfaced three bugs. Plus the monitoring use case got 1 tool (not 4 — the others were premature).

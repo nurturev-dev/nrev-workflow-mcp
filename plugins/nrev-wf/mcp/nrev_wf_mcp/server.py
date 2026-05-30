@@ -555,6 +555,14 @@ def validate_workflow(workflow_id: str) -> dict:
     mutation (e.g. another `validate_workflow` call, or a no-op
     `update_node_setting`) to force the cache to refresh. Self-heals
     quickly; don't waste time chasing ghost errors.
+
+    v0.2.28: downstream-cache lag workaround. If you see
+    "Fields not found in available data: <column>" on a node whose parent
+    DOES have <column> in `outputs.columns_metadata` (verify via `get_node`
+    on the parent), the input cache on the downstream block didn't propagate.
+    `attach_node` now auto-retries this defensively, but if you hit it via
+    other code paths: re-`update_node_setting` on a referencing field with
+    the SAME value to force the downstream block to refresh its inputs[].
     """
     return _validate_workflow_impl(workflow_id)
 
@@ -2695,6 +2703,23 @@ def update_node_setting(
     if verify and result["ok"]:
         result["verify"] = _verify_node_after_update(workflow_id, node_id, target, verify_cost_ack)
 
+    # v0.2.28 Fix #4 — when the platform returns "Whoops! Missing a field - X",
+    # hint that the node may use the reference-group envelope pattern (where
+    # the agent submitted a flat field but the node wants a nested
+    # `<parent>-<child>` group). Saved 2-4 wasted attempts in the 2026-05-29
+    # session for Enrich Company / Enrich People / Fetch Jobs.
+    err_text = result.get("node_config_error") or ""
+    if isinstance(err_text, str) and "Missing a field" in err_text:
+        result["hint"] = (
+            "Some native nodes (Enrich Company, Enrich People, Fetch Jobs, "
+            "etc.) require a reference-group envelope, not a flat field. "
+            "Example: instead of `<prefix>-domain`, use `<prefix>-company_reference` "
+            "wrapping a list of `{field_name, field_value}` entries — see "
+            "docs/NATIVE_NODE_SETTINGS_COOKBOOK.md for the canonical shape "
+            "per node. If you've already supplied the envelope, the missing "
+            "field name in the error IS the canonical group name to set."
+        )
+
     return result
 
 
@@ -3686,6 +3711,13 @@ def get_node_dynamic_fields(
     """Get the FULL field schema for a Pipedream-action node, including
     dynamic fields that materialize after a connection is bound.
 
+    ⚠️ PIPEDREAM ACTIONS ONLY (catalog `value` slug starts with `pipedream.`).
+    For NATIVE nodes (`linkedin_scraping.*`, `people_data.*`, `company_data.*`,
+    `nrev_tables.*`, `data_manipulation.*`, AI nodes, etc.) this endpoint
+    returns HTTP 500 — v0.2.28 catches the failure and returns structured
+    guidance pointing at `docs/NATIVE_NODE_SETTINGS_COOKBOOK.md`. Don't call
+    this tool on a native node expecting a schema response.
+
     This is the v0.2.19 breakthrough that unlocks the customer-tenant
     use case. Wraps `POST /nodes/updated-config-and-status` — the same
     endpoint the platform's UI calls when a Pipedream node's settings
@@ -3756,13 +3788,49 @@ def get_node_dynamic_fields(
                 "setting first, then call this tool."
             )
 
-    resp = api.updated_node_config(
-        node_id=node_id,
-        node_definition_id=target.get("typeId", ""),
-        field_name_changed=field_name_changed,
-        setting_field_values=sfv,
-        settings_schema=[],
-    )
+    # v0.2.28 Fix #2 — detect native nodes (typeIds where the catalog `value`
+    # slug doesn't start with `pipedream.`). The /nodes/updated-config-and-status
+    # endpoint is Pipedream-action-specific and returns HTTP 500 for native
+    # typeIds. Pre-fix the agent saw raw 500s and didn't know what to do; the
+    # 2026-05-29 friction analysis showed this consumed 5+ exploration turns.
+    try:
+        resp = api.updated_node_config(
+            node_id=node_id,
+            node_definition_id=target.get("typeId", ""),
+            field_name_changed=field_name_changed,
+            setting_field_values=sfv,
+            settings_schema=[],
+        )
+    except Exception as e:
+        # Most likely: native node (non-Pipedream) returning HTTP 500. Translate
+        # to a structured response pointing at the cookbook + alternative
+        # discovery strategies. We don't try to disambiguate every error class
+        # — any failure here is unrecoverable from this endpoint, so the
+        # cookbook pointer is the most useful response either way.
+        return {
+            "node_id": node_id,
+            "node_definition_id": target.get("typeId"),
+            "ok": False,
+            "error_kind": "native_or_unsupported",
+            "raw_error": f"{type(e).__name__}: {str(e)[:300]}",
+            "guidance": (
+                "This typeId likely belongs to a NATIVE node (catalog `value` "
+                "slug doesn't start with `pipedream.`). Native nodes don't "
+                "expose a dynamic-field schema via this endpoint — the platform "
+                "endpoint /nodes/updated-config-and-status is Pipedream-only.\n\n"
+                "How to discover settings for native nodes instead:\n"
+                "  1. Consult docs/NATIVE_NODE_SETTINGS_COOKBOOK.md — canonical "
+                "     settings dicts for the ~20 most-used native nodes "
+                "     (Enrich Company, Enrich People, Get Person Profile, "
+                "     Classifier, AI Ranker, the 4 nrev_tables nodes, etc.).\n"
+                "  2. If not in the cookbook: find an existing workflow that "
+                "     uses this typeId (search via `list_workflows` or graph "
+                "     scan), then `get_node` to read its working settings."
+            ),
+            # Surface the catalog typeId so the cookbook lookup is easy
+            "fields": None,
+            "dropdown_field_names": None,
+        }
 
     fields = (resp.get("nodeDefinition") or {}).get("fields") or []
     dropdowns = [
@@ -4594,6 +4662,37 @@ def attach_node(
     node you want, plus understand its expected settings shape. Then construct
     the `settings` dict (mapping field_name → value) and pass it here.
 
+    🍳 FOR NATIVE NODES — start with `docs/NATIVE_NODE_SETTINGS_COOKBOOK.md`
+    (v0.2.28). It documents the canonical settings shapes for the ~20 most-used
+    native typeIds: LinkedIn Scraping (Get Person Profile, Get Post by Person),
+    People Data (Enrich People, Search People), Company Data (Enrich Company,
+    Fetch Jobs), nRev Tables (Query/Add/Update/Get Row). Without the cookbook,
+    agents spelunk customer workflows for ~30 turns to learn shapes (verified
+    2026-05-29).
+
+    TEMPLATE SYNTAX (UNIVERSAL — applies to all node types):
+      - Bare `{{column_name}}` resolves to the upstream column value.
+      - NOT `{{data.column_name}}` — that prefix works only for some Pipedream
+        actions, not for native or nrev_tables nodes. Stick to `{{name}}`.
+      - Column names MUST be valid Python identifiers (snake_case, no spaces,
+        no hyphens). If your Input Form column is `Linkedin URL`, templates
+        like `{{Linkedin URL}}` will silently fail to resolve. Rename it to
+        `linkedin_url` upstream.
+      - Templated values always resolve to STRINGS. For number/boolean target
+        columns, cast in an upstream Magic Node: `df["score"] = df["score"].astype(int)`.
+
+    REFERENCE-GROUP ENVELOPE SHAPE (some native nodes only):
+      Some native nodes accept settings as a flat field (Get Person Profile):
+        settings = {"linkedin_scraping-get_person_profile-linkedin_url": "..."}
+      Others require a nested envelope grouping multiple input methods
+      (Enrich Company, Enrich People, Fetch Jobs):
+        settings = {"company_data-enrich_company-company_reference": [
+            {"field_name": "domain", "field_value": "..."},
+        ]}
+      Picking the wrong shape returns `"Whoops! Missing a field - <name>"` —
+      v0.2.28's `update_node_setting` injects a `hint` field flagging this.
+      See cookbook for the per-node shape.
+
     For app-backed nodes (Gmail send, Sheets read/write, Calendar list, etc.),
     use `list_connections()` to find the connection_id and include it in the
     settings as the platform expects (typically a field like
@@ -5070,12 +5169,63 @@ def attach_node(
         except Exception:
             pass
 
+    # v0.2.28 Fix #1 + Fix #3 — flip `ok` based on post-attach validation, AND
+    # attempt one defensive retry for the "Fields not found in available data"
+    # pattern (where v0.2.23's _build_inputs_from_parents didn't fire for the
+    # typeId, leaving inputs[] empty on the freshly-attached block).
+    #
+    # The 2026-05-29 friction analysis showed an agent reading `ok: true` on a
+    # block that had `node_config_error: "Oops! No settings provided..."` and
+    # moving on for 30+ turns before noticing. Make `ok` honest.
+    validation = _maybe_validate(workflow_id, validate_after)
+    post_attach_node_error = None
+    if validation:
+        for ne in validation.get("node_errors", []) or []:
+            if ne.get("node_id") == actual_new_id:
+                post_attach_node_error = ne.get("error")
+                break
+
+    input_refresh_recovered = False
+    if (
+        post_attach_node_error
+        and "Fields not found in available data" in post_attach_node_error
+        and parent_node_ids
+    ):
+        # v0.2.23 Fix #3 (_build_inputs_from_parents) should have prevented
+        # this but didn't fire for some typeIds (linkedin_scraping.* observed
+        # 2026-05-29). Re-PUT the node once to force the platform to refresh
+        # its inputs from the parent's outputs.
+        try:
+            wf_latest = api.get_workflow(workflow_id)
+            latest = next(
+                (b for b in (wf_latest.get("blocks") or []) if b.get("id") == actual_new_id),
+                None,
+            )
+            if latest is None:
+                raise RuntimeError("new block missing after attach")
+            api.put_node(workflow_id, actual_new_id, latest)
+            validation = _maybe_validate(workflow_id, validate_after)
+            post_attach_node_error = None
+            if validation:
+                for ne in validation.get("node_errors", []) or []:
+                    if ne.get("node_id") == actual_new_id:
+                        post_attach_node_error = ne.get("error")
+                        break
+            if not post_attach_node_error:
+                input_refresh_recovered = True
+        except Exception:
+            # Best-effort: if the retry itself errors, leave the original
+            # post_attach_node_error in place so the caller still sees the
+            # underlying problem.
+            pass
+
+    final_err = err or post_attach_node_error
     return {
-        "ok": err is None,
+        "ok": final_err is None,
         "node_id": actual_new_id,
         "type_id": type_id,
         "name": name,
-        "node_config_error": err,
+        "node_config_error": final_err,
         "workflowConfigError": resp.get("workflowConfigError"),
         "isRunable": resp.get("isRunable"),
         "is_trigger": resolved_is_trigger,   # final value applied to the block
@@ -5084,7 +5234,11 @@ def attach_node(
         "resolved_labels": resolved_labels,  # which dropdown fields got auto-resolved
         "explicit_labels": list(field_labels.keys()),  # which were caller-supplied
         "pipedream_field_warnings": pipedream_field_warnings,  # v0.2.20
-        "validation": _maybe_validate(workflow_id, validate_after),
+        # v0.2.28: present + True if the input-refresh defensive retry recovered
+        # an attach that would have failed validation. Useful diagnostic for the
+        # agent to know we papered over a platform quirk.
+        "input_refresh_recovered": input_refresh_recovered,
+        "validation": validation,
     }
 
 
