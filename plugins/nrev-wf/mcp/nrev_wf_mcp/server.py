@@ -4072,6 +4072,40 @@ def auto_map_pipedream_columns(
     """For an Add Single Row node downstream of a Sheets read, auto-fill
     the `col_NNNN` fields with `{{<upstream_header_name>}}` templates.
 
+    ⚠️ NAME-MATCH ONLY — READ THIS BEFORE USING:
+
+    This helper assumes the destination sheet's HEADER ROW literally
+    matches the upstream's column NAMES. When that holds (you're reading
+    Sheet A and writing to Sheet B with the same schema), it works. When
+    it DOESN'T (the common case — enriching one source and writing to a
+    differently-headered destination), this silently produces broken
+    templates that resolve to empty/literal at runtime, with NO warning.
+
+    Example silent failure (verified live 2026-05-31):
+        Upstream emits: timestamp, who, what, status, notes
+        Destination headers: Name, Email, Company, Score
+        This helper writes: col_0000={{Name}}, col_0001={{Email}}, ...
+        At runtime: every template resolves to empty (no `Name` upstream).
+
+    PREFER manual mapping by the AGENT (not this helper). The agent has
+    semantic context this helper cannot — it can combine columns
+    (`{{first_name}} {{last_name}}` → `Full Name`), type-coerce, apply
+    defaults, etc. The agent-driven flow:
+
+        1. attach_node(...) for a Sheets-write typeId — v0.2.30 auto-fires
+           reload-props and surfaces `dynamic_props.col_to_label` +
+           `dynamic_props.parent_upstream_columns` in the response.
+        2. For each col_NNNN in col_to_label, decide what upstream value
+           belongs there.
+        3. update_node_setting(..., 'col_NNNN', '{{<chosen_upstream>}}')
+           per destination column.
+
+    Use this helper ONLY when:
+      - You've inspected col_to_label and confirmed every destination
+        header matches an upstream column verbatim (or you're testing).
+      - You're prototyping a same-schema pass-through and want the fast
+        path without writing N update_node_setting calls.
+
     v0.2.21 — uses `reload_pipedream_props` to discover col_NNNN.label
     (which IS the destination sheet's header name), then wraps each in a
     Jinja-like template that references the upstream column of the same
@@ -4696,6 +4730,7 @@ def attach_node(
     validate_after: bool = True,
     force_root: bool = False,
     force_demote_listener: bool = False,
+    auto_expand_dynamic_props: bool = True,
 ) -> dict:
     """Generic block-attach for ANY node type (Scheduler, Gmail, Calendar, AI, etc.).
 
@@ -5300,6 +5335,137 @@ def attach_node(
             pass
 
     final_err = err or post_attach_node_error
+
+    # v0.2.30 — for Pipedream Sheets-write typeIds (and any other dynamic-
+    # props node), auto-fire reload-props to materialize col_NNNN fields and
+    # surface them to the agent. The pre-v0.2.30 friction: attach_node
+    # returned ok:true with a static 5-field payload, the platform accepted
+    # it, validation passed, but col_NNNN (the per-column data slots that
+    # the runtime ACTUALLY writes to) never existed. The node silently wrote
+    # empty rows at execution time.
+    #
+    # CRITICAL: we DO NOT auto-map col_NNNN to template values here. The
+    # agent has the only semantic context (combine first_name + last_name
+    # into Full Name, type-coerce score to int, etc.). Auto-name-matching
+    # (the v0.2.21 auto_map_pipedream_columns approach) silently produces
+    # garbage when destination headers don't match upstream column names.
+    # We surface col_to_label + parent_upstream_columns to the agent and
+    # let it map via update_node_setting in the same turn.
+    dynamic_props_info: Optional[dict] = None
+    if (
+        auto_expand_dynamic_props
+        and final_err is None
+        and type_id in _DYNAMIC_PROPS_TYPEIDS
+        and actual_new_id is not None
+    ):
+        try:
+            schema = reload_pipedream_props(workflow_id, actual_new_id)
+        except Exception as e:
+            dynamic_props_info = {
+                "attempted": True,
+                "ok": False,
+                "error": str(e),
+                "hint": (
+                    "reload_pipedream_props failed — the per-column input "
+                    "fields (col_NNNN) were not materialized. The node may "
+                    "look attached but writes empty rows at runtime. "
+                    "Inspect the typeId's actual schema or call "
+                    "reload_pipedream_props manually."
+                ),
+            }
+        else:
+            if schema.get("has_dynamic_props"):
+                col_to_label = schema.get("col_to_label") or {}
+                dyp = schema.get("dynamic_props_id")
+
+                # Derive component prefix for building col_NNNN field paths
+                component_prefix = None
+                for f in (schema.get("fields") or []):
+                    nm = f.get("name") or ""
+                    if "-col_" in nm:
+                        component_prefix = nm.rsplit("-col_", 1)[0] + "-"
+                        break
+
+                # Persist dynamic_props_id (required for the node to honor
+                # the expanded schema at runtime). Do NOT touch the col_NNNN
+                # field values — the agent fills them.
+                persisted_dyp = False
+                if dyp and component_prefix:
+                    try:
+                        update_node_setting(
+                            workflow_id,
+                            actual_new_id,
+                            f"{component_prefix}dynamic_props_id",
+                            dyp,
+                            validate_after=False,
+                            add_if_missing=True,
+                        )
+                        persisted_dyp = True
+                    except Exception:
+                        # Non-fatal: surface the dyp value so the agent can
+                        # persist manually.
+                        pass
+
+                # Pull upstream column names from the new block's inputs[]
+                # (post-attach state) so the agent immediately sees what's
+                # available to map FROM.
+                parent_upstream_columns: list[str] = []
+                try:
+                    wf_for_inputs = api.get_workflow(workflow_id)
+                    new_block = next(
+                        (b for b in (wf_for_inputs.get("blocks") or [])
+                         if b.get("id") == actual_new_id),
+                        None,
+                    )
+                    if new_block:
+                        for inp in (new_block.get("inputs") or []):
+                            for c in (inp.get("columns") or []):
+                                if c and c not in parent_upstream_columns:
+                                    parent_upstream_columns.append(c)
+                except Exception:
+                    pass
+
+                dynamic_props_info = {
+                    "attempted": True,
+                    "ok": True,
+                    "type_name": _DYNAMIC_PROPS_TYPEIDS[type_id],
+                    "dynamic_props_id": dyp,
+                    "dynamic_props_id_persisted": persisted_dyp,
+                    # Destination columns the agent needs to fill:
+                    "col_to_label": col_to_label,
+                    # Upstream columns available to map FROM:
+                    "parent_upstream_columns": parent_upstream_columns,
+                    "note": (
+                        "Destination headers shown in `col_to_label` "
+                        "(key=field path suffix, value=actual sheet header). "
+                        "Map each one explicitly via "
+                        "`update_node_setting(node_id, "
+                        "'<component_prefix>col_NNNN', '{{upstream_col}}')`. "
+                        "Agent decides the mapping — no auto-match. See "
+                        "docs/NATIVE_NODE_SETTINGS_COOKBOOK.md "
+                        "(\"Pipedream Sheets writes — 2-phase pattern\")."
+                    ),
+                }
+            else:
+                # typeId was in _DYNAMIC_PROPS_TYPEIDS but reload-props says
+                # this node doesn't actually have dynamic props. Either the
+                # typeId list is wrong (remove it) or static settings aren't
+                # bound enough yet (rare; surface for diagnosis).
+                dynamic_props_info = {
+                    "attempted": True,
+                    "ok": False,
+                    "has_dynamic_props": False,
+                    "errors": schema.get("errors") or [],
+                    "hint": (
+                        "Node was expected to have dynamic Pipedream props "
+                        "(col_NNNN per destination column) but reload-props "
+                        "returned has_dynamic_props=False. Likely the "
+                        "required static settings (connection / sheetId / "
+                        "worksheetId / hasHeaders) aren't all bound. Set "
+                        "them and call reload_pipedream_props manually."
+                    ),
+                }
+
     return {
         "ok": final_err is None,
         "node_id": actual_new_id,
@@ -5318,6 +5484,13 @@ def attach_node(
         # an attach that would have failed validation. Useful diagnostic for the
         # agent to know we papered over a platform quirk.
         "input_refresh_recovered": input_refresh_recovered,
+        # v0.2.30: present + ok:True when attach_node auto-materialized the
+        # dynamic-props schema (col_NNNN per destination column) for known
+        # Pipedream Sheets-write typeIds. The agent uses col_to_label +
+        # parent_upstream_columns to drive update_node_setting per col_NNNN.
+        # None when typeId isn't in _DYNAMIC_PROPS_TYPEIDS or the caller
+        # passed auto_expand_dynamic_props=False.
+        "dynamic_props": dynamic_props_info,
         "validation": validation,
     }
 
@@ -6418,6 +6591,37 @@ def get_plugin_version() -> dict:
 # until a real use case proves they're needed beyond ad-hoc Python.
 
 
+# v0.2.30 — typeIds whose schema is finalized via the Pipedream `reload-props`
+# call AFTER the static settings are bound. For these nodes, the per-column
+# input fields (`col_0000`, `col_0001`, ... = the destination sheet's header
+# row) literally do not exist on the block until reload-props is triggered.
+# Pre-v0.2.30, attach_node returned `ok:true` with no col_NNNN fields — the
+# node accepted the settings the agent passed but had nothing to map data
+# INTO at runtime, silently writing empty rows.
+#
+# When attach_node detects one of these typeIds AND the initial attach
+# validates cleanly, it auto-fires reload_pipedream_props, persists the
+# issued dynamic_props_id, and surfaces `col_to_label` +
+# `parent_upstream_columns` in the response so the agent has everything it
+# needs to map per-column templates in the same turn (via update_node_setting).
+#
+# DELIBERATELY does NOT auto-map: the agent has semantic context (combine
+# `first_name` + `last_name` into `Full Name`, etc.) that a name-matcher
+# cannot. See the cookbook's "Pipedream Sheets writes" section.
+#
+# Currently conservative — Sheets writes only. Add typeIds here ONLY after
+# verifying with reload_pipedream_props that `has_dynamic_props: true` and
+# col_NNNN fields are present. Adding a typeId that doesn't actually have
+# dynamic props is harmless (reload-props returns has_dynamic_props=False
+# and we skip), but adds an unnecessary API call per attach.
+_DYNAMIC_PROPS_TYPEIDS: dict[str, str] = {
+    "191db4a1-7c72-4c4a-af02-b507701ca61b": "Add Single Row",
+    "b220d182-d786-4ce7-b332-e2a824a86afc": "Add Multiple Rows",
+    "f8b6d11f-4f72-489c-9c63-a3da6c9eea7d": "Upsert Row",
+    "3df67eff-0724-4e43-b43e-681a6f01ea1f": "Update/Upsert Row",
+}
+
+
 # Static map of app keyword → set of typeIds and the field-name fragment that
 # carries the resource identifier. Used by find_workflows_using_resource.
 # Sourced from list_node_definitions probes (2026-05-25/26 on prod).
@@ -6533,6 +6737,7 @@ def find_workflows_using_resource(
     app: str,
     resource_id: str,
     active_within_days: int = 30,
+    include_never_run: bool = True,
     max_workflows: int = 5000,
 ) -> dict:
     """Find every workflow that references a specific external resource
@@ -6546,11 +6751,17 @@ def find_workflows_using_resource(
     Sheets this is the spreadsheet id (e.g. '1_k71sm0X8...'), for Slack
     the channel id ('C0B64N2JTCY'), for nRev tables the table UUID.
 
-    `active_within_days`: scan only workflows whose `lastRunAt` is within
-    this window. Default 30 days = ~120 workflows on a typical tenant =
-    ~4-second scan. Pass `active_within_days=0` (or a huge value) to scan
-    every workflow including stale ones — that's ~80s on a 2k-workflow
-    tenant (verified 2026-05-26 prod).
+    `active_within_days`: scan workflows whose `lastRunAt` is within this
+    window. Default 30 days. Workflows OUTSIDE the window (stale) are
+    skipped. Pass `active_within_days=0` to disable the filter entirely.
+
+    `include_never_run` (v0.2.30 default True): also include workflows
+    with `lastRunAt=null` — workflows that have been built but never
+    executed. Without this, a freshly-built workflow that references the
+    resource won't show up in the scan (the most-common surprise for the
+    "did I just deploy this with the right channel?" use case). Pass
+    `include_never_run=False` to restrict to workflows that have actually
+    run at least once.
 
     Returns a dict:
     ```
@@ -6617,15 +6828,25 @@ def find_workflows_using_resource(
             all_wfs = all_wfs[:max_workflows]
             break
 
-    # 2. Active-window filter
+    # 2. Active-window filter (v0.2.30 — include_never_run defaults True
+    #    so fresh workflows aren't silently skipped, which was the most
+    #    common surprise on the "did I just deploy this referencing the
+    #    right resource?" use case).
     skipped_stale = 0
+    kept_never_run = 0
     if active_within_days and active_within_days > 0:
         cutoff = _dt.now(_tz.utc) - _td(days=int(active_within_days))
         kept = []
         for w in all_wfs:
             lr = w.get("lastRunAt") or w.get("last_run_at")
             if not lr:
-                skipped_stale += 1
+                # Never-run workflow. Default behavior: keep it
+                # (`include_never_run=True`). Opt-out skips it as stale.
+                if include_never_run:
+                    kept.append(w)
+                    kept_never_run += 1
+                else:
+                    skipped_stale += 1
                 continue
             try:
                 lr_dt = _dt.fromisoformat(lr.replace("Z", "+00:00"))
@@ -6634,7 +6855,13 @@ def find_workflows_using_resource(
                 else:
                     skipped_stale += 1
             except Exception:
-                skipped_stale += 1
+                # Unparseable timestamp — treat as never-run for kept/stale
+                # accounting; we can't know if it's recent or not.
+                if include_never_run:
+                    kept.append(w)
+                    kept_never_run += 1
+                else:
+                    skipped_stale += 1
         all_wfs = kept
 
     # 3. Parallel scan
@@ -6685,8 +6912,14 @@ def find_workflows_using_resource(
             "app": app,
             "resource_id": resource_id,
             "active_within_days": active_within_days,
+            "include_never_run": include_never_run,
             "workflows_scanned": len(all_wfs),
             "workflows_skipped_stale": skipped_stale,
+            # v0.2.30: how many of the scanned workflows had lastRunAt=null
+            # (i.e. were kept by include_never_run rather than the active
+            # window). If you don't see your freshly-deployed workflow,
+            # check that this count > 0.
+            "workflows_kept_never_run": kept_never_run,
             "matches_count": len(matches),
             "scan_duration_seconds": round(_time.time() - t0, 2),
         },

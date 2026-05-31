@@ -12,7 +12,7 @@
       "source": "./plugins/nrev-wf",
       "category": "productivity",
       "keywords": ["nrev", "workflow", "tables", "monitoring", "gtm", "mcp"],
-      "version": "0.2.29"
+      "version": "0.2.30"
     }
   ]
 }

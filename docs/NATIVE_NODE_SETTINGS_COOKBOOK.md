@@ -145,17 +145,24 @@ settings = {
 | Category | People Data |
 | is_trigger? | NO — needs a parent supplying the reference column |
 
-**Alternative**: `RocketReach: Enrich People` is a separate node with typeId
-`43ae6689-b0f2-44bc-b34a-970ec02dedd2` (is_trigger=True, can be root).
-Same `person_reference` envelope.
+> **Reference-group inner field_name needs FULL prefix.** This is a real
+> gotcha: inside a `person_reference` envelope, each item's `field_name`
+> uses the SAME `<app>-<action>-<key>` prefix as the outer field — NOT
+> the bare key (`linkedin_url`). Bare-key form returns `"Whoops! Missing
+> a field"` live. Verified 2026-05-30 cookbook agent. Same rule applies
+> to Search People, Enrich Company, Fetch Jobs (any Shape-B node).
 
 ```python
 settings = {
     "people_data-enrich_people-person_reference": [
-        {"field_name": "linkedin_url", "field_value": "{{linkedin_url}}"},
+        # Inner field_name MUST carry the full prefix:
+        {"field_name": "people_data-enrich_people-linkedin_url",
+         "field_value": "{{linkedin_url}}"},
         # OR (mutually exclusive with linkedin_url):
-        # {"field_name": "email", "field_value": "{{email}}"},
-        # {"field_name": "name", "field_value": "{{name}}"},
+        # {"field_name": "people_data-enrich_people-email",
+        #  "field_value": "{{email}}"},
+        # {"field_name": "people_data-enrich_people-name",
+        #  "field_value": "{{name}}"},
     ],
     "people_data-enrich_people-enrichment_fields": [
         # subset of the allowed list — pick what you need:
@@ -175,6 +182,10 @@ org_primary_domain, name, org_name`.
 **Output columns** = the subset you put in `enrichment_fields`. Order matters
 for downstream column-mapping; keep the list short.
 
+**Alternative**: `RocketReach: Enrich People` is a separate node with typeId
+`43ae6689-b0f2-44bc-b34a-970ec02dedd2` (is_trigger=True, can be root).
+Same `person_reference` envelope; same full-prefix rule on inner items.
+
 ### Search People (Apollo)
 
 | Property | Value |
@@ -187,12 +198,15 @@ for downstream column-mapping; keep the list short.
 ```python
 settings = {
     "people_data-search_people-person_reference": [
+        # Inner field_name uses the FULL prefix (same rule as Enrich People).
         # Must include at least one search criterion — name alone is too
         # loose; combine with title/company/organization. Validated live
         # 2026-05-30: passing only `name` returns
         # "At least one search criteria field must be provided".
-        {"field_name": "name", "field_value": "Alice Example"},
-        {"field_name": "organization_name", "field_value": "Acme Corp"},
+        {"field_name": "people_data-search_people-name",
+         "field_value": "Alice Example"},
+        {"field_name": "people_data-search_people-organization_name",
+         "field_value": "Acme Corp"},
     ],
     "people_data-search_people-per_page": 1,  # cap to control cost
 }
@@ -200,13 +214,13 @@ settings = {
 
 **Alternative**: `RocketReach: Search People` is a separate node with typeId
 `99631757-7b8a-4fc9-9733-b47d5702d9b2` (different filter fields, same
-envelope shape).
+envelope shape; same full-prefix rule on inner items).
 
 ---
 
 ## Company Data
 
-### Enrich Company
+### Enrich Company (native)
 
 | Property | Value |
 |---|---|
@@ -218,15 +232,41 @@ envelope shape).
 ```python
 settings = {
     "company_data-enrich_company-company_reference": [
-        {"field_name": "domain", "field_value": "{{company_domain}}"},
+        # Inner field_name uses the FULL prefix (Enrich Company tolerated
+        # the bare-key form in some cases live 2026-05-30 but DO NOT rely
+        # on that; the full-prefix form is the contract).
+        {"field_name": "company_data-enrich_company-domain",
+         "field_value": "{{company_domain}}"},
         # OR linkedin_url, OR name (mutually exclusive):
-        # {"field_name": "linkedin_url", "field_value": "{{company_linkedin}}"},
+        # {"field_name": "company_data-enrich_company-linkedin_url",
+        #  "field_value": "{{company_linkedin}}"},
     ],
 }
 ```
 
-**Alternative**: `RocketReach: Enrich Company` is a separate node with typeId
-`119be39f-278e-46fd-a0b9-15bc81eb85cb` (is_trigger=True). Same envelope.
+### RocketReach: Enrich Company (DIFFERENT SHAPE — flat, not envelope)
+
+| Property | Value |
+|---|---|
+| typeId | `119be39f-278e-46fd-a0b9-15bc81eb85cb` |
+| Shape | **FLAT with `lookup_by` discriminator** (NOT the `company_reference` envelope) |
+| Category | Company Data |
+| is_trigger? | YES — can be a workflow root |
+
+> **Do not copy the native Enrich Company shape here.** RocketReach uses a
+> flat field set with a `lookup_by` discriminator — completely different
+> from the native node despite the similar name. Verified live 2026-05-31.
+
+```python
+settings = {
+    "company_data-rocketreach_enrich_company-lookup_by": "company_domain",
+    "company_data-rocketreach_enrich_company-company_domain": "{{company_domain}}",
+    # If lookup_by="company_linkedin_url", use the field below instead:
+    # "company_data-rocketreach_enrich_company-company_linkedin_url": "{{company_linkedin}}",
+    # If lookup_by="company_name", use:
+    # "company_data-rocketreach_enrich_company-company_name": "{{company_name}}",
+}
+```
 
 ### Fetch Jobs
 
@@ -240,7 +280,9 @@ settings = {
 ```python
 settings = {
     "company_data-fetch_jobs-company_details": [
-        {"field_name": "domain", "field_value": "{{company_domain}}"},
+        # Inner field_name uses the FULL prefix:
+        {"field_name": "company_data-fetch_jobs-domain",
+         "field_value": "{{company_domain}}"},
     ],
 }
 ```
@@ -454,12 +496,82 @@ settings = {
 }
 ```
 
-### Add Single Row / Add Multiple Rows / Upsert Row / Update/Upsert Row
+### Add Single Row / Add Multiple Rows / Upsert Row / Update/Upsert Row — 2-PHASE PATTERN
 
-Same `sheetId` + `worksheetId` trap. Plus row values come from the upstream
-block's columns (the platform reads upstream column NAMES + matches to sheet
-headers when `hasHeaders=true`). Don't try to specify row values directly in
-`settings` — they get silently ignored.
+These four typeIds have a **two-phase configuration**: the static fields
+(connection / sheetId / worksheetId / hasHeaders) get bound first, THEN
+the platform expands per-column input fields (`col_0000`, `col_0001`, ...)
+— one per header in the destination sheet — via a `reload-props` call.
+
+Before v0.2.30, `attach_node` only handled phase 1. The block accepted
+the settings, validation passed, `node_config_error: null` — but the
+`col_NNNN` fields literally didn't exist on the block. At runtime, every
+row got written with empty values. The node was "configured" and "broken"
+at the same time.
+
+**v0.2.30 fix**: `attach_node` auto-fires `reload_pipedream_props` after
+the initial attach for typeIds in `_DYNAMIC_PROPS_TYPEIDS` (the four
+above), persists the issued `dynamic_props_id`, and surfaces the
+destination column schema to the agent:
+
+```python
+result = attach_node(
+    workflow_id=..., parent_node_ids=[<parent>],
+    type_id="191db4a1-7c72-4c4a-af02-b507701ca61b",  # Add Single Row
+    name="Append Lead to CRM Sheet",
+    settings={
+        "pipedream-google_sheets-google_sheets_add_single_row-googleSheets_connection_id": "<conn_id>",
+        "pipedream-google_sheets-google_sheets_add_single_row-sheetId": "<spreadsheet_url_id>",
+        "pipedream-google_sheets-google_sheets_add_single_row-worksheetId": "<numeric_gid>",
+        "pipedream-google_sheets-google_sheets_add_single_row-hasHeaders": "true",
+    },
+)
+
+# v0.2.30 — result.dynamic_props is populated automatically:
+# {
+#   "ok": True,
+#   "type_name": "Add Single Row",
+#   "dynamic_props_id": "dyp_XYZ",                ← already persisted
+#   "col_to_label": {
+#     "col_0000": "Name",                          ← destination header row
+#     "col_0001": "Email",                         ←   (read from sheet via
+#     "col_0002": "Company",                       ←    Pipedream Google
+#     "col_0003": "Score",                         ←    Sheets connection)
+#   },
+#   "parent_upstream_columns": [
+#     "first_name", "last_name", "personal_email", "company_name", "ai_score",
+#   ],
+# }
+```
+
+**Phase 2 — agent maps explicitly** (no auto-match, by design):
+
+```python
+# Agent decides each destination → upstream mapping using its semantic
+# understanding. Concatenate fields, type-coerce, etc. Auto-name-matching
+# (the v0.2.21 auto_map_pipedream_columns helper) is a NAME-MATCH ONLY
+# shortcut — when destination headers don't match upstream column names
+# verbatim, it silently writes broken templates. Don't use it as default.
+prefix = "pipedream-google_sheets-google_sheets_add_single_row-"
+update_node_setting(workflow_id, node_id, f"{prefix}col_0000",
+                    "{{first_name}} {{last_name}}")   # combine upstream
+update_node_setting(workflow_id, node_id, f"{prefix}col_0001",
+                    "{{personal_email}}")
+update_node_setting(workflow_id, node_id, f"{prefix}col_0002",
+                    "{{company_name}}")
+update_node_setting(workflow_id, node_id, f"{prefix}col_0003",
+                    "{{ai_score}}")
+```
+
+**Opt-out**: pass `auto_expand_dynamic_props=False` to `attach_node` if you
+want to handle the reload-props phase manually (rare — useful only if
+your sheet headers change between attach and runtime, or you're testing
+the platform behavior).
+
+**`auto_map_pipedream_columns` is still available** for the
+"destination headers == upstream column names" shortcut case, but its
+docstring now opens with a loud warning about silent failure when they
+diverge.
 
 ---
 

@@ -213,7 +213,9 @@ def test_find_workflows_using_resource_unknown_app_returns_error():
 
 
 def test_find_workflows_using_resource_filters_stale_workflows():
-    """active_within_days=30 should skip workflows whose lastRunAt is older."""
+    """v0.2.30 default semantics: active_within_days=30 still skips workflows
+    OUTSIDE the window, but include_never_run=True (default) KEEPS workflows
+    that have never run (lastRunAt=null) — the freshly-deployed case."""
     from datetime import datetime, timedelta, timezone
     now = datetime.now(timezone.utc)
     fresh = (now - timedelta(days=5)).isoformat().replace("+00:00", "Z")
@@ -227,7 +229,6 @@ def test_find_workflows_using_resource_filters_stale_workflows():
         ]
     }
 
-    # The fresh workflow has a matching Sheets node; stale + never don't
     fresh_wf = {
         "name": "Fresh WF",
         "blocks": [{
@@ -251,11 +252,71 @@ def test_find_workflows_using_resource_filters_stale_workflows():
             app="google_sheets", resource_id="TARGET", active_within_days=30
         )
 
-    # Only fresh workflow was scanned; stale + never skipped
-    assert result["scan_meta"]["workflows_scanned"] == 1
-    assert result["scan_meta"]["workflows_skipped_stale"] == 2
+    # v0.2.30: fresh + never-run both kept; only the 200-day-old one is stale
+    assert result["scan_meta"]["workflows_scanned"] == 2
+    assert result["scan_meta"]["workflows_skipped_stale"] == 1
+    assert result["scan_meta"]["workflows_kept_never_run"] == 1
     assert result["scan_meta"]["matches_count"] == 1
     assert result["matches"][0]["workflow_id"] == "wf-fresh"
+
+
+def test_find_workflows_using_resource_include_never_run_false_restores_old_behavior():
+    """Opt-out: pass include_never_run=False to skip never-run workflows
+    (pre-v0.2.30 default behavior)."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    fresh = (now - timedelta(days=5)).isoformat().replace("+00:00", "Z")
+
+    fake_list = {
+        "data": [
+            {"id": "wf-fresh", "lastRunAt": fresh},
+            {"id": "wf-never", "lastRunAt": None},
+        ]
+    }
+
+    with patch("nrev_wf_mcp.server.api.list_workflows", return_value=fake_list), \
+         patch("nrev_wf_mcp.server.api.get_workflow",
+                return_value={"name": "", "blocks": []}):
+        result = find_workflows_using_resource(
+            app="google_sheets", resource_id="TARGET",
+            active_within_days=30, include_never_run=False,
+        )
+
+    assert result["scan_meta"]["workflows_scanned"] == 1
+    assert result["scan_meta"]["workflows_skipped_stale"] == 1
+    assert result["scan_meta"]["workflows_kept_never_run"] == 0
+    assert result["scan_meta"]["include_never_run"] is False
+
+
+def test_find_workflows_using_resource_freshly_built_wf_is_found_by_default():
+    """The motivating use case: agent just built a workflow referencing
+    a resource. lastRunAt=None. The scan MUST find it by default."""
+    fake_list = {
+        "data": [{"id": "wf-just-built", "lastRunAt": None}]
+    }
+    fresh_wf = {
+        "name": "Just built",
+        "blocks": [{
+            "id": "n1", "typeId": "191db4a1-7c72-4c4a-af02-b507701ca61b",
+            "variableName": "Add Row to Mindy Sheet",
+            "settings_field_values": [
+                {"field_name": "pipedream-google_sheets-google_sheets_add_single_row-sheetId",
+                 "field_value": "FRESHLY_DEPLOYED"},
+            ],
+        }],
+    }
+    with patch("nrev_wf_mcp.server.api.list_workflows", return_value=fake_list), \
+         patch("nrev_wf_mcp.server.api.get_workflow", return_value=fresh_wf):
+        result = find_workflows_using_resource(
+            app="google_sheets", resource_id="FRESHLY_DEPLOYED",
+        )
+
+    assert result["scan_meta"]["matches_count"] == 1, (
+        "v0.2.30 must surface freshly-deployed (never-run) workflows by "
+        "default. If you're seeing 0 matches, the include_never_run guard "
+        "regressed."
+    )
+    assert result["matches"][0]["workflow_id"] == "wf-just-built"
 
 
 def test_find_workflows_using_resource_match_includes_node_pinpoint():
