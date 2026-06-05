@@ -230,6 +230,20 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
 
+### v0.2.31 — Ask AI structured-output editor no longer blank (string-shape preservation)
+
+**The "your schema IS configured, the editor just couldn't render it" release.** Live debugging 2026-06-02 of an Ask AI node with structured output configured via the MCP revealed the UI's Structured Output editor box appearing blank, even though the schema was stored and output columns were correctly registered. Root cause: v0.2.24's JSON-coerce in `update_node_setting` (Fix #1, task #65) silently parsed every JSON-formatted string input into a dict — but `ai_toolkit-ask_ai-response_json`'s canonical platform shape is a JSON-formatted TEXT STRING because the UI editor reads `field_value` as raw text and renders it in a code editor. Storing a dict left the editor with nothing to display. Reproducible in any tenant.
+
+**Fix — new `_STRING_SHAPED_FIELD_SUFFIXES` allowlist.** Currently contains just `-response_json`. When `update_node_setting`'s `field_path` ends with one of these suffixes: (a) a dict/list value gets `json.dumps()`'d with 2-space indent before storing, (b) a string value passes through verbatim (no parse-to-dict coerce). Everything else preserves v0.2.24's behavior. Field-name-anchored match (leading `-`) so unrelated fields ending with similar letters don't accidentally trigger. Extensible — add a suffix only after live-confirming the platform stores it as a text string.
+
+**Cookbook v1.3 — new "AI Toolkit — Ask AI (structured output)" section.** Documents the 2-step config (set `response_type` first, then `response_json`), explains the v0.2.31 string-shape contract with a WRONG vs CORRECT table, and includes a recovery snippet for nodes already broken by a pre-v0.2.31 MCP write. `update_node_setting` docstring gets a new "VALUE-SHAPE COERCION" section explaining when v0.2.24 vs v0.2.31 paths fire.
+
+**Recovering an already-broken node** (the customer-tenant fix that triggered this release): just call `update_node_setting(workflow_id, broken_node_id, "ai_toolkit-ask_ai-response_json", <schema as dict or string>)` from a v0.2.31 MCP. The canonical string shape will overwrite the dict on the next save and the UI editor box will display the schema again.
+
+**Tool count: 76 → 76 (no new tools).** Tests: 382 → 393 (+11 in `test_v0_2_31_fixes.py` covering: suffix registry shape, string input passthrough, dict input auto-stringification, indented format for UI readability, list input handling, v0.2.24 coerce preserved for non-allowlisted fields, anchor-match prevents spurious triggers, plain-string passthrough for other fields, nested-path matching, cookbook coverage check).
+
+No breaking changes — only the allowlisted field changes behavior, and the new behavior is what the platform actually expects.
+
 ### v0.2.30 — Sheets-write 2-phase auto-fire + cookbook v1.2 + scan covers fresh workflows (no new tools)
 **The "Add Single Row actually writes data" release.** Live debugging 2026-05-31 of a v0.2.29 Add Single Row attach revealed it was silently broken: `node_config_error: null`, validation passed, but the per-column data fields (`col_0000`..`col_NNNN`) literally didn't exist on the block. At runtime, every row got written with empty values. Root cause: Pipedream Sheets-write nodes have a **two-phase configuration** — static settings get accepted, THEN the platform materializes per-column `col_NNNN` input fields via `reload-props` (one per destination sheet header). `attach_node` only handled phase 1. The v0.2.21 `auto_map_pipedream_columns` helper did the second phase but blindly name-matched (`col_NNNN.label` → `{{label}}`), silently producing garbage when destination headers ≠ upstream column names.
 

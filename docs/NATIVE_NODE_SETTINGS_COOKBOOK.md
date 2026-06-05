@@ -403,6 +403,60 @@ settings = {
 
 ---
 
+## AI Toolkit — Ask AI (structured output)
+
+The Ask AI node (`ai_toolkit.ask_ai`, typeId `78dc33d4-c4d5-433a-8e65-c549faca037c`) supports structured output: the AI returns a JSON object matching a schema you supply, and each top-level key becomes an output column.
+
+Two-step config:
+
+1. **Set `response_type` to `"structured_output"`** — flips the node from free-form text to schema-driven mode.
+2. **Set `response_json` to a JSON schema describing the keys you want.**
+
+```python
+# Step 1
+update_node_setting(workflow_id, node_id,
+                    "ai_toolkit-ask_ai-response_type",
+                    "structured_output")
+
+# Step 2 — pass either a Python dict OR a JSON string. v0.2.31 normalizes
+# both shapes to the canonical platform shape (a JSON text string) so
+# the UI's Structured Output editor renders the schema correctly.
+update_node_setting(workflow_id, node_id,
+                    "ai_toolkit-ask_ai-response_json",
+                    {
+                        "Fit": "true or false",
+                        "persona_bucket": "AI/ML | Eng Leadership | None",
+                        "reason": "1-2 sentences",
+                    })
+```
+
+### The v0.2.31 string-shape contract — why this matters
+
+The platform stores `response_json` as a **JSON-formatted TEXT STRING** (not a parsed dict). The UI's Structured Output editor reads `field_value` as raw text and renders it in a code editor. If the field is stored as a dict, the editor box appears **blank** in the UI — even though the runtime accepts the schema and derives output columns from the keys.
+
+Pre-v0.2.31, the v0.2.24 JSON-coerce logic in `update_node_setting` silently parsed every dict-string input into a dict — making the field unrecoverable from the MCP. Live-verified 2026-06-02 in workflow `93f6b1d9-...`. v0.2.31 carves out `-response_json` as a string-shaped field:
+
+| Caller passes | v0.2.31 stores | UI editor shows |
+|---|---|---|
+| `{"Fit": "...", ...}` (dict) | indented JSON text string | the formatted schema ✓ |
+| `'{"Fit": "...", ...}'` (JSON string) | the same string verbatim | the schema ✓ |
+
+No more "schema is configured but the box is blank."
+
+### Recovering an already-broken node
+
+If you have an Ask AI node whose Structured Output box is blank from a pre-v0.2.31 MCP write:
+
+```python
+update_node_setting(workflow_id, broken_node_id,
+                    "ai_toolkit-ask_ai-response_json",
+                    <the schema as dict or string>)
+```
+
+The v0.2.31 path will overwrite the stored dict with the canonical string form on the next save, and the UI editor will start displaying it again.
+
+---
+
 ## Extending the cookbook
 
 This is the v1 cut covering nodes verified in real prod workflows during the

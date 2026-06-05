@@ -2681,25 +2681,63 @@ def update_node_setting(
     (creditCostPerItem > 0, typically AI nodes), additional opt-in is required —
     pass `verify_cost_ack=True` to confirm the spend. Without ack, verify is
     skipped on paid nodes and an explanatory note is returned.
+
+    VALUE-SHAPE COERCION (v0.2.24 + v0.2.31):
+
+    Most fields whose canonical platform shape is a parsed dict/list will
+    accept a JSON-formatted string and be coerced (v0.2.24 Fix #1) — e.g.
+    a `references` array on a Magic Node passed as `'["edge_a", "edge_b"]'`
+    parses back into a list.
+
+    String-shaped fields (currently `*-response_json` for Ask AI structured
+    output) take the opposite path: the platform's UI editor reads
+    `field_value` as raw TEXT and renders it in a code editor. Storing a
+    dict here makes the editor box appear blank (live-verified 2026-06-02).
+    v0.2.31 special-cases these field names — if you pass a dict, it gets
+    pretty-printed (`json.dumps(value, indent=2)`) before storing; if you
+    pass a string, it goes through verbatim. See `_STRING_SHAPED_FIELD_SUFFIXES`
+    + docs/NATIVE_NODE_SETTINGS_COOKBOOK.md ("AI Toolkit — Ask AI").
     """
-    # v0.2.24 Fix #1: MCP transport coerces structured values (lists/dicts) to
-    # JSON strings under some callers. If we receive a string that LOOKS like
-    # JSON (starts with [ or {), try to parse it back. Without this defensive
-    # coerce, a `references` array on a Magic Node arrives as the literal
-    # string '["edge1","edge2"]' and the platform validator iterates over it
-    # character-by-character (one warning per `[`, `"`, `e`, `d`, `g`, …).
-    # Detected via the screenshot in the 2026-05-25 session — Claude burned
-    # several attempts trying to edit Magic Node references before giving up
-    # and rebuilding the node.
-    if isinstance(value, str) and value and value[0] in "[{":
-        try:
-            parsed = _json.loads(value)
-            if isinstance(parsed, (list, dict)):
-                value = parsed
-        except (_json.JSONDecodeError, ValueError):
-            # Not JSON — value is a string that happens to start with [ or {.
-            # Leave it as-is (the field probably expects exactly that string).
-            pass
+    # v0.2.31 — string-shaped fields (canonical platform shape = JSON text
+    # string, NOT a parsed dict). For these fields we bypass v0.2.24's
+    # parse-to-dict coerce AND auto-stringify any dict/list input. Live-
+    # verified 2026-06-02 against ai_toolkit-ask_ai-response_json: the
+    # Structured Output editor in app.nrev.ai reads `field_value` as raw
+    # text; storing a dict makes the editor box blank even though the
+    # platform technically accepts the dict and derives output columns from
+    # its keys. Take the explicit string path so the UI displays the schema
+    # and the runtime + editor see the same artifact.
+    matched_string_shaped_suffix = next(
+        (s for s in _STRING_SHAPED_FIELD_SUFFIXES if field_path.endswith(s)),
+        None,
+    )
+    if matched_string_shaped_suffix is not None:
+        if isinstance(value, (dict, list)):
+            # Re-serialize with stable formatting so the UI editor renders
+            # cleanly (2-space indent, no key sort — preserves caller intent).
+            value = _json.dumps(value, indent=2, ensure_ascii=False)
+        # If value is already a str (the canonical shape), pass it through
+        # unchanged. SKIP the v0.2.24 coerce block below — that's what
+        # silently turns a string into a dict for this exact case.
+    else:
+        # v0.2.24 Fix #1: MCP transport coerces structured values (lists/dicts)
+        # to JSON strings under some callers. If we receive a string that
+        # LOOKS like JSON (starts with [ or {), try to parse it back. Without
+        # this defensive coerce, a `references` array on a Magic Node arrives
+        # as the literal string '["edge1","edge2"]' and the platform validator
+        # iterates over it character-by-character (one warning per `[`, `"`,
+        # `e`, `d`, `g`, …). Detected via the screenshot in the 2026-05-25
+        # session — Claude burned several attempts trying to edit Magic Node
+        # references before giving up and rebuilding the node.
+        if isinstance(value, str) and value and value[0] in "[{":
+            try:
+                parsed = _json.loads(value)
+                if isinstance(parsed, (list, dict)):
+                    value = parsed
+            except (_json.JSONDecodeError, ValueError):
+                # Not JSON — value is a string that happens to start with [ or {.
+                # Leave it as-is (the field probably expects exactly that string).
+                pass
 
     wf = api.get_workflow(workflow_id)
     target = next((b for b in wf["blocks"] if b["id"] == node_id), None)
@@ -6620,6 +6658,37 @@ _DYNAMIC_PROPS_TYPEIDS: dict[str, str] = {
     "f8b6d11f-4f72-489c-9c63-a3da6c9eea7d": "Upsert Row",
     "3df67eff-0724-4e43-b43e-681a6f01ea1f": "Update/Upsert Row",
 }
+
+
+# v0.2.31 — field-name suffixes whose canonical PLATFORM SHAPE is a
+# JSON-formatted TEXT STRING (not a parsed dict/list). The platform's UI
+# editor reads field_value as a string and renders it in a code-editor
+# textarea; storing a dict instead makes the editor box appear blank
+# (live-verified 2026-06-02 with ai_toolkit-ask_ai-response_json).
+#
+# v0.2.24 Fix #1 was a useful defensive coerce for fields whose canonical
+# shape IS a parsed object — when an MCP caller accidentally JSON-stringifies
+# them, the coerce restores the dict. But for the fields listed here,
+# v0.2.24's coerce is harmful: it converts the canonical string-shape back
+# into a dict, breaking the UI editor and making schema config look "blank"
+# even when it's stored.
+#
+# Match is `field_path.endswith(suffix)` so the suffix should include the
+# leading `-` to avoid spuriously matching unrelated fields whose names
+# happen to end with the same letters.
+#
+# Behavior in update_node_setting when field_path matches:
+#   - if value is a str: store as-is (skip v0.2.24's parse-to-dict coerce)
+#   - if value is a dict/list: json.dumps() it to a string before storing
+#   - other types (int, bool, None): leave unchanged (rare for these fields)
+#
+# Add a suffix here ONLY after live-confirming the platform stores it as a
+# raw string (check `field_value` on a working node — if it's a string,
+# allowlist it). Adding a non-string-shaped field here would force-stringify
+# the dict and break the runtime.
+_STRING_SHAPED_FIELD_SUFFIXES: tuple[str, ...] = (
+    "-response_json",  # ai_toolkit.ask_ai — structured output schema; UI is a code editor
+)
 
 
 # Static map of app keyword → set of typeIds and the field-name fragment that
