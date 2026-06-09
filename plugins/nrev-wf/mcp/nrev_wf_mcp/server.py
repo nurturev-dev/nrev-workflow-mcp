@@ -391,6 +391,7 @@ def get_node_output(
     limit: int = 50,
     columns: Optional[list[str]] = None,
     drop_json_columns: bool = False,
+    search: Optional[str] = None,
 ) -> dict:
     """Fetch the actual rows produced by a node in a specific past execution.
 
@@ -400,11 +401,17 @@ def get_node_output(
     `limit` is clamped to 100 (the API silently returns 0 rows above that).
     Use `skip` for pagination.
 
+    v0.2.32: `search` forwards to the API's `search_string` — server-side
+    cross-table substring filter, same behavior as the UI's data-preview
+    search box. Use this BEFORE paginating: a search like `search="acme"`
+    will return only rows where ANY column contains "acme" (case-insensitive).
+    Eliminates 50+ paginated round-trips for "show me the rows mentioning X".
+
     Two ways to shrink response size when rows carry heavy JSON columns
     (e.g. `person_linkedin_profile` carries 40+ nested fields per row, which
     blows up context fast):
 
-    - `columns=["x", "y"]` — project to only these columns. Other columns are
+    - `columns=["x", "y"]` — project to only those columns. Other columns are
       dropped. Use when you know exactly what you want.
     - `drop_json_columns=True` — auto-drop any column whose value is a dict /
       list (i.e. is JSON-typed). Use when you want everything scalar.
@@ -413,6 +420,10 @@ def get_node_output(
     client-side after the API returns — they don't change what's stored
     upstream, just what comes back over the MCP wire.
 
+    For datasets too large to skim row-by-row even with search/projection,
+    use `download_node_output` (v0.2.32) — auto-paginates internally and
+    writes a local JSONL file you can analyze with pandas / duckdb / jq.
+
     Returns:
         {"total_entries": N, "skip": ..., "limit": ..., "rows": [...],
          "projected_columns": [...] | None}
@@ -420,6 +431,7 @@ def get_node_output(
     raw = api.get_node_preview(
         workflow_id, execution_id, node_id,
         handle_condition=handle_condition, skip=skip, limit=limit,
+        search_string=search,
     )
     rows = raw.get("data", []) if isinstance(raw, dict) else raw
     meta = raw.get("meta") or {}
@@ -484,6 +496,212 @@ def _project_rows(
         return projected, ordered_kept
 
     return rows, list(rows[0].keys()) if rows else []
+
+
+# ─── v0.2.32: download_node_output ─────────────────────────────────────────
+# Default download root. Files live under <root>/<execution_id>/<...>.jsonl
+# so multiple downloads from the same run land together and don't collide
+# with other runs. ~/.nrev-wf-mcp/downloads is created lazily.
+_DEFAULT_DOWNLOAD_ROOT = "~/.nrev-wf-mcp/downloads"
+
+# Hard ceiling on auto-pagination — if the dataset is bigger than this,
+# caller must explicitly raise max_rows. Prevents a single download_node_output
+# call from hitting the API 10,000+ times by accident.
+_DOWNLOAD_DEFAULT_MAX_ROWS = 100_000
+_DOWNLOAD_HARD_CEILING = 1_000_000
+
+
+@mcp.tool()
+def download_node_output(
+    workflow_id: str,
+    execution_id: str,
+    node_id: str,
+    handle_condition: str = "_default",
+    search: Optional[str] = None,
+    columns: Optional[list[str]] = None,
+    max_rows: int = _DOWNLOAD_DEFAULT_MAX_ROWS,
+    target_path: Optional[str] = None,
+    overwrite: bool = False,
+) -> dict:
+    """Download the full node-output dataset to a local JSONL file for
+    offline analysis with pandas / duckdb / jq.
+
+    Solves the "I need to analyze N thousand rows but pagination is killing
+    me" friction. Auto-paginates internally (limit=100 per call, the API
+    cap), writes one JSON object per line to a local file, and returns the
+    file path plus a few copy-pasteable one-liners.
+
+    Use this when:
+      - You want open-ended analysis (group-by, distribution, outliers)
+        over a dataset too big for `get_node_output`'s 100-row window.
+      - You want to keep the full dataset out of the model's context.
+      - You already know the structure but want to slice many ways.
+
+    Use `get_node_output(search="...")` instead when:
+      - You're looking for specific rows by substring — the API-side
+        search filter is dramatically cheaper than downloading everything.
+      - You only need the first ~100 rows.
+
+    `target_path` defaults to
+    `~/.nrev-wf-mcp/downloads/<execution_id>/<node_id>-<handle>.jsonl`.
+    Pass an explicit absolute path to override. Parent dirs are created.
+
+    `search` forwards to the API's `search_string` — same cross-table
+    substring filter as the UI. Useful for "download all rows mentioning
+    X" without first paginating to find them.
+
+    `columns=["x", "y"]` projects each row to a subset before writing —
+    keeps the file small when the source has heavy JSON columns you don't
+    need.
+
+    `max_rows` is a safety cap on auto-pagination. Default 100,000.
+    Override up to 1,000,000 explicitly if your dataset is larger; the
+    tool refuses anything above the hard ceiling.
+
+    `overwrite=False`: refuses to clobber an existing file (default).
+    Pass True to replace.
+
+    Returns:
+        {
+          "ok": bool,
+          "path": "<absolute path>",
+          "total_rows_downloaded": N,
+          "total_rows_available": M,  ← from API meta.total_entries
+          "complete": bool,           ← False if max_rows hit before exhausting
+          "columns": [...],           ← keys from the first row
+          "file_size_bytes": N,
+          "rounds": N,                ← number of API pages fetched
+          "sample_commands": {
+              "pandas":  "uv run python -c \"...\"",
+              "duckdb":  "uv run python -c \"...\"",
+              "jq":      "jq -s '...' PATH",
+          },
+        }
+    """
+    import os as _os
+    import json as _json
+
+    # Resolve + validate the target path
+    if target_path:
+        path = _os.path.abspath(_os.path.expanduser(target_path))
+    else:
+        root = _os.path.abspath(_os.path.expanduser(_DEFAULT_DOWNLOAD_ROOT))
+        path = _os.path.join(root, str(execution_id),
+                              f"{node_id}-{handle_condition}.jsonl")
+
+    if _os.path.exists(path) and not overwrite:
+        return {
+            "ok": False,
+            "error_kind": "file_exists",
+            "path": path,
+            "message": (
+                f"refusing to overwrite {path!r}. Pass overwrite=True to "
+                f"replace, or pick a different target_path."
+            ),
+        }
+
+    if max_rows > _DOWNLOAD_HARD_CEILING:
+        return {
+            "ok": False,
+            "error_kind": "max_rows_too_high",
+            "message": (
+                f"max_rows={max_rows} exceeds the hard ceiling "
+                f"({_DOWNLOAD_HARD_CEILING:_}). If your dataset is genuinely "
+                f"this large, download in chunks via skip + a smaller "
+                f"max_rows, or analyze in-workflow with a Magic Node."
+            ),
+        }
+    if max_rows < 1:
+        return {"ok": False, "error_kind": "max_rows_too_low",
+                "message": "max_rows must be >= 1"}
+
+    _os.makedirs(_os.path.dirname(path), exist_ok=True)
+
+    # Auto-paginate
+    PAGE = 100  # API cap
+    total_written = 0
+    total_available: Optional[int] = None
+    first_row_keys: list[str] = []
+    rounds = 0
+    skip = 0
+
+    with open(path, "w", encoding="utf-8") as fh:
+        while total_written < max_rows:
+            raw = api.get_node_preview(
+                workflow_id, execution_id, node_id,
+                handle_condition=handle_condition,
+                skip=skip, limit=PAGE, search_string=search,
+            )
+            rows = raw.get("data", []) if isinstance(raw, dict) else raw
+            meta = raw.get("meta") or {}
+            if total_available is None:
+                total_available = meta.get("total_entries")
+            rounds += 1
+            if not rows:
+                break
+
+            # Optional projection (same logic as get_node_output)
+            if columns is not None:
+                rows = [{c: r.get(c) for c in columns} for r in rows]
+
+            for row in rows:
+                if total_written == 0 and not first_row_keys:
+                    first_row_keys = list(row.keys())
+                fh.write(_json.dumps(row, ensure_ascii=False, default=str))
+                fh.write("\n")
+                total_written += 1
+                if total_written >= max_rows:
+                    break
+
+            if len(rows) < PAGE:
+                break  # last page was short → no more rows
+            skip += PAGE
+
+    file_size = _os.path.getsize(path)
+    complete = (
+        total_available is None
+        or total_written >= (total_available or 0)
+    )
+
+    sample_commands = {
+        "pandas": (
+            f"uv run python -c \"import pandas as pd; "
+            f"df = pd.read_json('{path}', lines=True); "
+            f"print(df.shape); print(df.describe(include='all'))\""
+        ),
+        "duckdb": (
+            f"uv run python -c \"import duckdb; "
+            f"print(duckdb.sql(\\\"SELECT * FROM read_json('{path}') LIMIT 5\\\"))\""
+        ),
+        "jq_count_by_first_column": (
+            f"jq -s 'group_by(.{first_row_keys[0]} // null) | "
+            f"map({{key: .[0].{first_row_keys[0]}, count: length}})' "
+            f"'{path}'"
+        ) if first_row_keys else None,
+    }
+    sample_commands = {k: v for k, v in sample_commands.items() if v}
+
+    return {
+        "ok": True,
+        "path": path,
+        "total_rows_downloaded": total_written,
+        "total_rows_available": total_available,
+        "complete": complete,
+        "columns": first_row_keys,
+        "file_size_bytes": file_size,
+        "rounds": rounds,
+        "sample_commands": sample_commands,
+        "note": (
+            "JSONL format — one JSON object per line. Nested fields preserved. "
+            "Read with pd.read_json(path, lines=True) or duckdb's read_json(). "
+            "For very wide datasets, project with columns=[...] to keep the "
+            "file small."
+        ) if complete else (
+            f"Truncated at max_rows={max_rows} of "
+            f"{total_available} total. Re-call with a larger max_rows or "
+            f"download in chunks (skip+max_rows) if you need everything."
+        ),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3881,34 +4099,97 @@ def get_node_dynamic_fields(
             settings_schema=[],
         )
     except Exception as e:
-        # Most likely: native node (non-Pipedream) returning HTTP 500. Translate
-        # to a structured response pointing at the cookbook + alternative
-        # discovery strategies. We don't try to disambiguate every error class
-        # — any failure here is unrecoverable from this endpoint, so the
-        # cookbook pointer is the most useful response either way.
+        # Most likely: native node (non-Pipedream) returning HTTP 500. The
+        # dynamic-config endpoint is Pipedream-specific.
+        #
+        # v0.2.32 — instead of just pointing at the cookbook, FETCH the
+        # node-definition catalog entry and return its `settings` array.
+        # This unlocks introspection of native nodes' available model
+        # dropdowns (Ask AI: 19 models — GPT/o-series/Parallel Web/Claude),
+        # conditionalVisibility cross-field constraints (web_search_enabled
+        # only valid for OpenAI models), credit cost per option, etc.
+        # Pre-v0.2.32 the agent had to spelunk existing nodes to discover
+        # any of this — see 2026-06-08 "agent claimed GPT not available"
+        # friction report.
+        type_id = target.get("typeId", "")
+        try:
+            defn = api.get_node_definition(type_id)
+        except Exception as e_def:
+            return {
+                "node_id": node_id,
+                "node_definition_id": type_id,
+                "ok": False,
+                "error_kind": "native_or_unsupported",
+                "raw_error": f"{type(e).__name__}: {str(e)[:300]}",
+                "definition_fetch_error": (
+                    f"{type(e_def).__name__}: {str(e_def)[:200]}"
+                ),
+                "guidance": (
+                    "Native node — and the catalog fallback also failed. "
+                    "Consult docs/NATIVE_NODE_SETTINGS_COOKBOOK.md or "
+                    "find_workflows_using_resource + get_node on an "
+                    "existing node with this typeId."
+                ),
+                "fields": None,
+                "dropdown_field_names": None,
+            }
+
+        # Project the catalog's `settings` array into the same shape the
+        # Pipedream path returns (name, type, label, required, default_value,
+        # conditional_visibility, options). Field names are already
+        # human-readable in the catalog.
+        catalog_settings = defn.get("settings") or []
+        fields = []
+        dropdowns = []
+        for s in catalog_settings:
+            field = {
+                "name": s.get("name"),
+                "type": s.get("type"),
+                "label": s.get("label"),
+                "required": s.get("required", False),
+                "default_value": s.get("defaultValue"),
+                "placeholder": s.get("placeholder"),
+                # conditionalVisibility carries cross-field constraints
+                # (e.g. web_search_enabled requires model in [openai...])
+                "conditional_visibility": s.get("conditionalVisibility"),
+            }
+            # Surface dropdown options. Two locations in the catalog payload:
+            # - `options` at top level (older shape, used by response_type)
+            # - `dataSource.options` (newer shape, used by `model`)
+            opts = s.get("options")
+            if not opts and isinstance(s.get("dataSource"), dict):
+                opts = s["dataSource"].get("options")
+            if opts:
+                field["options"] = opts
+                # Detect "this is a dropdown / select" → list the field name
+                if s.get("type") in ("select", "multi_select"):
+                    dropdowns.append(s["name"])
+            fields.append(field)
+
         return {
             "node_id": node_id,
-            "node_definition_id": target.get("typeId"),
-            "ok": False,
-            "error_kind": "native_or_unsupported",
-            "raw_error": f"{type(e).__name__}: {str(e)[:300]}",
-            "guidance": (
-                "This typeId likely belongs to a NATIVE node (catalog `value` "
-                "slug doesn't start with `pipedream.`). Native nodes don't "
-                "expose a dynamic-field schema via this endpoint — the platform "
-                "endpoint /nodes/updated-config-and-status is Pipedream-only.\n\n"
-                "How to discover settings for native nodes instead:\n"
-                "  1. Consult docs/NATIVE_NODE_SETTINGS_COOKBOOK.md — canonical "
-                "     settings dicts for the ~20 most-used native nodes "
-                "     (Enrich Company, Enrich People, Get Person Profile, "
-                "     Classifier, AI Ranker, the 4 nrev_tables nodes, etc.).\n"
-                "  2. If not in the cookbook: find an existing workflow that "
-                "     uses this typeId (search via `list_workflows` or graph "
-                "     scan), then `get_node` to read its working settings."
+            "node_definition_id": type_id,
+            "ok": True,
+            "source": "node_definition_catalog",  # vs Pipedream's dynamic-config
+            "node_type": defn.get("type"),
+            "node_name": defn.get("name"),
+            "category": defn.get("category"),
+            "is_trigger": defn.get("is_trigger"),
+            "is_listener": defn.get("isListener"),
+            "starting_price": defn.get("startingPrice"),
+            "field_count": len(fields),
+            "fields": fields,
+            "dropdown_field_names": dropdowns,
+            "note": (
+                "This is the static catalog schema for a NATIVE node (no "
+                "Pipedream dynamic-props phase). Use `fields[].options` for "
+                "select-field choices (model dropdowns, response_type, etc.) "
+                "and `fields[].conditional_visibility` for cross-field "
+                "constraints (e.g. web_search_enabled requires model in a "
+                "specific list of OpenAI models for Ask AI). v0.2.32 — "
+                "introspection added so agents don't have to spelunk for the "
+                "model catalog."
             ),
-            # Surface the catalog typeId so the cookbook lookup is easy
-            "fields": None,
-            "dropdown_field_names": None,
         }
 
     fields = (resp.get("nodeDefinition") or {}).get("fields") or []
@@ -6548,16 +6829,337 @@ def tables_update_row(table_id: str, row_id: int, values: dict,
 
 
 @mcp.tool()
-def tables_delete_row(table_id: str, row_id: int,
-                       confirm: bool = False) -> dict:
-    """Delete one row. NOT YET LIVE — M1 endpoint. Currently 405.
-    `confirm=True` required."""
+def tables_delete_rows(
+    table_id: str,
+    row_ids: list[int],
+    confirm: bool = False,
+) -> dict:
+    """Delete one or more rows from a table. v0.2.32 — endpoint went live
+    2026-06-02; uses the bulk-delete API which atomically deletes up to
+    1000 rows in one call.
+
+    Pass a single-element list for a single row delete:
+        tables_delete_rows(table_id, [42], confirm=True)
+
+    Pass multiple ids for bulk delete:
+        tables_delete_rows(table_id, [1, 2, 3], confirm=True)
+
+    Missing row_ids are silently skipped (per the API contract) —
+    `deleted_row_ids` in the response echoes only the ids that were
+    actually removed.
+
+    `confirm=True` is REQUIRED (destructive). Without it returns a refusal
+    without making the API call.
+
+    Returns:
+      {ok, deleted_row_ids: [...], skipped_row_ids: [...],
+       table: {row_count, last_updated_at}}.
+
+    `skipped_row_ids` is computed client-side as the diff between input
+    row_ids and the API's deleted_row_ids — useful for "did the row I
+    cared about actually exist?" assertions.
+    """
     if not confirm:
         return {
             "ok": False,
             "message": "Destructive operation. Pass confirm=True to actually delete.",
         }
-    return tables_api.delete_row(table_id, row_id)
+    if not row_ids:
+        return {"ok": False, "message": "row_ids is empty — nothing to delete."}
+    if len(row_ids) > 1000:
+        return {
+            "ok": False,
+            "message": (
+                f"row_ids has {len(row_ids)} entries; the bulk-delete endpoint "
+                f"caps at 1000 per call. Split into chunks."
+            ),
+        }
+    resp = tables_api.bulk_delete_rows(table_id, row_ids)
+    deleted = resp.get("deleted_row_ids", []) or []
+    requested = [int(r) for r in row_ids]
+    skipped = [r for r in requested if r not in set(deleted)]
+    return {
+        "ok": True,
+        "deleted_row_ids": deleted,
+        "skipped_row_ids": skipped,
+        "table": resp.get("table"),
+    }
+
+
+# Backward-compat alias: pre-v0.2.32 tool name. Some agents may already
+# reference `tables_delete_row` (singular). Keep it as a thin shim that
+# delegates to the new tool with a 1-element list.
+@mcp.tool()
+def tables_delete_row(table_id: str, row_id: int,
+                       confirm: bool = False) -> dict:
+    """⚠️ DEPRECATED v0.2.32 — use `tables_delete_rows` instead (accepts
+    a list of row_ids, hits the same bulk endpoint).
+
+    Kept as a backward-compat shim. Delegates to tables_delete_rows with a
+    single-element list. Confirm flag still required."""
+    return tables_delete_rows(table_id, [int(row_id)], confirm=confirm)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v0.2.32 — server-side analytics (aggregate, distinct, join)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The "I have 10K rows in a table and want to analyze it without paginating"
+# answer. All three endpoints went live 2026-06-02 on prod and are
+# documented + verified here.
+
+
+def _tables_resolve_id_to_name_map(table_id: str) -> dict:
+    """Inverse of _tables_resolve_name_map — for projecting API responses
+    that come back keyed by column_id back to human-readable names."""
+    schema = tables_api.get_table(table_id)
+    return {c["id"]: c["name"] for c in (schema.get("columns") or [])}
+
+
+@mcp.tool()
+def tables_aggregate(
+    table_id: str,
+    measures: list[dict],
+    group_by: Optional[list[dict]] = None,
+    filter: Optional[list[dict]] = None,
+    joins: Optional[list[dict]] = None,
+    sort: Optional[list[dict]] = None,
+    limit: Optional[int] = None,
+    skip: Optional[int] = None,
+    resolve_key_names: bool = True,
+) -> dict:
+    """Server-side count / count_distinct / sum / avg / min / max aggregation
+    on an nRev table, with optional group_by + filter + cross-table joins.
+    The "I have 10K rows and want stats without paginating" tool.
+
+    v0.2.32 — verified live 2026-06-08. Endpoint: POST /tables/{id}/aggregate.
+
+    `measures` (required): list of {"op": "...", "column_id": "...", "alias": "..."}.
+      ops: `count` (no column_id needed), `count_distinct`, `sum`, `avg`,
+      `min`, `max`. alias names the output key.
+
+    `group_by` (optional): list of {"column_id": "..."} — group by that column.
+      For a column in a JOINED table, pass {"table_id": "...", "column_id": "..."}.
+
+    `filter` (optional): list of {"column_id": "...", "operator": "...",
+      "value": [...]}. **WARNING — DIFFERENT FROM `tables_list_rows` FILTER**:
+        - Field is `operator` NOT `op`
+        - `value` MUST be a LIST even for scalar comparisons (`"value": [42]`)
+        - Booleans must be LOWERCASE STRINGS (`"value": ["true"]`, not Python bools)
+      operators: eq, neq, contains, gt, gte, lt, lte, is_empty, is_not_empty, in, not_in.
+
+    `joins` (optional): [{"type": "inner|left", "table_id": "...",
+      "on": {"base_column_id": "...", "joined_column_id": "..."}}]
+      Note: `on` is a single dict, NOT a list — single-column joins only.
+      Up to 3 joined tables.
+
+    `sort` / `limit` / `skip`: standard pagination on the GROUPS output.
+
+    `resolve_key_names` (v0.2.32, default True): replaces the API's
+    column-id-keyed `keys` dict with human-readable names from the schema.
+    Set False if you want the raw API shape.
+
+    Returns:
+      {groups: [{keys: {col_name: value}, measures: {alias: num}}],
+       meta: {group_count, truncated}}.
+
+    Example — total amount + order count per region:
+        tables_aggregate(
+            table_id, measures=[
+                {"op": "sum", "column_id": "<amount_col>", "alias": "total"},
+                {"op": "count", "alias": "n"},
+            ],
+            group_by=[{"column_id": "<region_col>"}],
+        )
+    """
+    if not measures:
+        return {"ok": False, "message": "measures is required and non-empty."}
+    resp = tables_api.aggregate(
+        table_id, measures, group_by=group_by, filter=filter,
+        joins=joins, sort=sort, limit=limit, skip=skip,
+    )
+    if not resolve_key_names:
+        return resp
+    # Name-resolve the keys for ergonomics. Pull schemas for base + any
+    # joined tables (joins entries may reference their own table_id).
+    table_ids: set[str] = {table_id}
+    for j in (joins or []):
+        if isinstance(j, dict) and j.get("table_id"):
+            table_ids.add(j["table_id"])
+    id_to_name: dict = {}
+    for tid in table_ids:
+        try:
+            id_to_name.update(_tables_resolve_id_to_name_map(tid))
+        except Exception:
+            # Best-effort; if a table can't be read, fall through with raw keys
+            pass
+    out_groups = []
+    for g in (resp.get("groups") or []):
+        raw_keys = g.get("keys") or {}
+        named_keys = {
+            id_to_name.get(k, k): v for k, v in raw_keys.items()
+        }
+        out_groups.append({"keys": named_keys, "measures": g.get("measures") or {}})
+    return {"groups": out_groups, "meta": resp.get("meta")}
+
+
+@mcp.tool()
+def tables_distinct_values(
+    table_id: str,
+    column_id_or_name: str,
+    filter: Optional[list[dict]] = None,
+    search: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """Server-side distinct values for one column — the "what categories
+    does this column actually have?" tool. Drives the UI's filter-chip
+    dropdowns.
+
+    v0.2.32 — verified live 2026-06-08. Endpoint:
+    POST /tables/{id}/columns/{col_id}/distinct-values.
+
+    `column_id_or_name` accepts either the column UUID or its display name
+    (resolved via the table schema). Use the UUID when you have it; the
+    name lookup is a convenience.
+
+    `filter` (optional): aggregate-style filter clauses — same shape as
+    `tables_aggregate`'s `filter` (`operator`, `value`-as-list, lowercase
+    string booleans). Narrows the universe before distincting.
+
+    `search` (optional): case-insensitive substring match on the value.
+    Use to populate type-ahead dropdowns.
+
+    `limit` (optional): cap the number of distinct values returned. Useful
+    for high-cardinality columns where you want the first N alphabetically.
+
+    Returns: {values: [...], meta: {total_distinct, truncated}}.
+    """
+    # Resolve column_id_or_name → column_id
+    if "-" not in column_id_or_name or len(column_id_or_name) < 36:
+        # Probably a name — resolve via schema
+        name_to_id = _tables_resolve_name_map(table_id)
+        column_id = name_to_id.get(column_id_or_name)
+        if not column_id:
+            return {
+                "ok": False,
+                "message": (
+                    f"column {column_id_or_name!r} not found in table. "
+                    f"Available: {sorted(name_to_id.keys())}"
+                ),
+            }
+    else:
+        column_id = column_id_or_name
+    return tables_api.distinct_values(
+        table_id, column_id, filter=filter, search=search, limit=limit,
+    )
+
+
+@mcp.tool()
+def tables_join(
+    base_table_id: str,
+    joins: list[dict],
+    base_filter: Optional[list[dict]] = None,
+    select: Optional[list[dict]] = None,
+    sort: Optional[list[dict]] = None,
+    limit: Optional[int] = None,
+    skip: Optional[int] = None,
+    resolve_column_names: bool = True,
+) -> dict:
+    """Server-side multi-table inner/left join with optional projection.
+
+    v0.2.32 — verified live 2026-06-08. Endpoint: POST /tables/{id}/join.
+
+    `joins` (required): [{"type": "inner|left", "table_id": "...",
+      "on": {"base_column_id": "...", "joined_column_id": "..."}}].
+      Note: `on` is a single dict — single-column joins only. Up to 3
+      joined tables (MAX_JOIN_ARITY).
+
+    `base_filter` (optional): aggregate-style filter clauses applied to
+    the BASE table before joining. Same shape as `tables_aggregate`'s
+    `filter` (`operator`, `value`-as-list).
+
+    `select` (optional): [{"table_id": "...", "column_id": "..."}, ...] —
+    projection. Omit to return all columns (capped at MAX_JOIN_PROJECTED_COLUMNS=200).
+
+    `sort`, `limit`, `skip`: standard pagination on the joined output.
+
+    `resolve_column_names` (v0.2.32, default True): rewrites the API's
+    prefix-keyed row dicts (`base.<col_id>`, `j0.<col_id>`, ...) to
+    human-readable column names. Disambiguates same-named columns across
+    tables by prefixing with the table name (e.g. `customers.customer`
+    when both base and joined have a `customer` column). Set False for
+    the raw shape.
+
+    Returns: {rows: [{...}], meta: {total_entries, skip, limit}}.
+
+    Example — orders ⋈ customers, get rows with tier:
+        tables_join(
+            base_table_id="<orders>",
+            joins=[{"type": "left", "table_id": "<customers>",
+                    "on": {"base_column_id": "<orders.customer>",
+                           "joined_column_id": "<customers.customer>"}}],
+            limit=100,
+        )
+    """
+    if not joins:
+        return {"ok": False, "message": "joins is required and non-empty."}
+    resp = tables_api.join_tables(
+        base_table_id, joins, base_filter=base_filter, select=select,
+        sort=sort, limit=limit, skip=skip,
+    )
+    if not resolve_column_names:
+        return resp
+
+    # Build column_id → (table_name, column_name) map across all involved tables
+    def _safe_schema(tid: str) -> dict:
+        try:
+            return tables_api.get_table(tid)
+        except Exception:
+            return {"columns": []}
+
+    base_schema = _safe_schema(base_table_id)
+    base_name = base_schema.get("name") or "base"
+    base_cols = {c["id"]: c["name"] for c in (base_schema.get("columns") or [])}
+
+    joined_schemas: list[tuple[str, dict]] = []
+    for j in joins:
+        if not isinstance(j, dict) or not j.get("table_id"):
+            continue
+        s = _safe_schema(j["table_id"])
+        joined_schemas.append((s.get("name") or j["table_id"], s))
+
+    # Detect name collisions across base + joined tables → prefix those
+    all_names: dict[str, int] = {}
+    for n in base_cols.values():
+        all_names[n] = all_names.get(n, 0) + 1
+    for _tname, sch in joined_schemas:
+        for c in (sch.get("columns") or []):
+            all_names[c["name"]] = all_names.get(c["name"], 0) + 1
+
+    def _rewrite_key(raw_key: str) -> str:
+        # raw_key shapes: "base.<col_id>" or "j<N>.<col_id>"
+        if "." not in raw_key:
+            return raw_key
+        prefix, col_id = raw_key.split(".", 1)
+        if prefix == "base":
+            cname = base_cols.get(col_id, col_id)
+            return f"{base_name}.{cname}" if all_names.get(cname, 0) > 1 else cname
+        # j0, j1, ...
+        try:
+            idx = int(prefix[1:])
+            tname, sch = joined_schemas[idx]
+            cname = next(
+                (c["name"] for c in (sch.get("columns") or []) if c["id"] == col_id),
+                col_id,
+            )
+            return f"{tname}.{cname}" if all_names.get(cname, 0) > 1 else cname
+        except (ValueError, IndexError):
+            return raw_key  # unrecognized — pass through
+
+    out_rows = []
+    for r in (resp.get("rows") or []):
+        out_rows.append({_rewrite_key(k): v for k, v in r.items()})
+    return {"rows": out_rows, "meta": resp.get("meta")}
 
 
 @mcp.tool()

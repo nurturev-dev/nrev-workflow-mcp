@@ -230,6 +230,31 @@ bulk_set_test_mode(<wf_id>, on=False)                      → flip back when re
 
 Recent versions, newest first. Run `/plugin update nrev-wf` then restart Claude Code to pick up the latest. (Manual installs: re-run the [one-line installer](#install-without-plugin-one-line-installer), or `git pull` in the clone, then restart.)
 
+### v0.2.32 — analytics over large data without pagination (4 new tools + 2 extensions)
+
+**The "stop paginating, start analyzing" release.** Three friction patterns surfaced over the last week converged on the same root cause: agents trying to analyze datasets larger than the 100-row paginated window. Fixed with a server-side analytics suite for tables + a download-then-pandas path for node outputs + a missing-API-introspection fix that solves the "agent doesn't know what models Ask AI supports" problem.
+
+**Extension #1 — `get_node_output(search="...")`.** Forwards to the API's `search_string` parameter (existed but wasn't exposed) — the same cross-table substring filter the UI's data-preview search box uses. Eliminates 50+ paginated round-trips for "show me rows mentioning X."
+
+**New tool — `download_node_output(workflow_id, execution_id, node_id, search=, columns=, max_rows=100000, target_path=, overwrite=False)`.** Auto-paginates internally at the API's 100-row cap, writes JSONL to disk (default: `~/.nrev-wf-mcp/downloads/<execution_id>/<node_id>-<handle>.jsonl`), and returns `{path, total_rows_downloaded, total_rows_available, complete, columns, sample_commands}`. `sample_commands` includes copy-pasteable pandas / duckdb / jq one-liners so the agent has an immediate next-step. Safety cap at 100K rows by default; hard ceiling at 1M. Refuses to clobber existing files unless `overwrite=True`. Solves "open-ended analysis over 5K rows" without blowing the context window.
+
+**New tools — server-side analytics on nRev tables** (all 4 endpoints went live on prod 2026-06-02, verified live 2026-06-08):
+- **`tables_delete_rows(table_id, row_ids, confirm=True)`** — bulk delete via `/rows/bulk-delete`. Up to 1000 rows atomically. Surfaces `skipped_row_ids` (missing ids the server silently dropped) so the agent knows what actually existed. Backward-compat shim `tables_delete_row` (singular) kept.
+- **`tables_aggregate(table_id, measures, group_by, filter, joins, sort, limit)`** — server-side count / count_distinct / sum / avg / min / max with group-by and up to 3 cross-table joins. Name-resolves keys back to readable column names by default. **Quirk documented in docstring:** the aggregate filter shape is DIFFERENT from `tables_list_rows` — uses `operator` (not `op`), value MUST be a list, booleans as lowercase strings. The "I have 10K rows and want totals per region" tool — no pagination needed.
+- **`tables_distinct_values(table_id, column_id_or_name, filter, search, limit)`** — unique values for one column with optional filter narrowing + substring search. Accepts column UUID or human name (resolved via schema).
+- **`tables_join(table_id, joins, base_filter, select, sort, limit)`** — multi-table inner/left joins. Rewrites the API's prefix-keyed row dicts (`base.<col_id>`, `j0.<col_id>`, `j1.<col_id>`) to human-readable names, with table-prefix disambiguation when the same column name exists in multiple tables.
+
+**Extension #2 — `get_node_dynamic_fields` introspects native nodes.** Pre-v0.2.32, native typeIds (Ask AI, LinkedIn Scraping, People Data, etc.) returned "use the cookbook" because the dynamic-config endpoint is Pipedream-only. **v0.2.32 falls through to `/node_definitions/{typeId}`** and returns the catalog's `settings` array with `dataSource.options` (the full model dropdown — 19 models including all 11 OpenAI/o-series, 3 Parallel Web, 4 Claude variants) and `conditionalVisibility` (cross-field constraints, e.g. `web_search_enabled` is OpenAI-only). The "agent claimed GPT not available in Ask AI" friction (2026-06-08) becomes structurally impossible.
+
+**Cookbook v1.4** — new sections:
+- "Available models" table for Ask AI (19 entries with per-row cost, default `gpt-4.1`).
+- "`web_search_enabled` is OpenAI-only" subsection with decision tree for "I want web research" use cases. **Parallel Web models have web research baked in** — the toggle is meaningless for them.
+- "Discovering native node schemas at runtime (v0.2.32)" pointer at `get_node_dynamic_fields`.
+
+**Tool count: 76 → 81** (+5 — download_node_output, tables_delete_rows, tables_aggregate, tables_distinct_values, tables_join). `tables_delete_row` kept as deprecated shim. **Tests: 393 → 422** (+29 in `test_v0_2_32_fixes.py`). Live-verified end-to-end against prod tables `v0_2_32_test_orders` + `v0_2_32_test_customers`.
+
+No breaking changes — extensions are backward-compatible (new optional params), new tools are additive.
+
 ### v0.2.31 — Ask AI structured-output editor no longer blank (string-shape preservation)
 
 **The "your schema IS configured, the editor just couldn't render it" release.** Live debugging 2026-06-02 of an Ask AI node with structured output configured via the MCP revealed the UI's Structured Output editor box appearing blank, even though the schema was stored and output columns were correctly registered. Root cause: v0.2.24's JSON-coerce in `update_node_setting` (Fix #1, task #65) silently parsed every JSON-formatted string input into a dict — but `ai_toolkit-ask_ai-response_json`'s canonical platform shape is a JSON-formatted TEXT STRING because the UI editor reads `field_value` as raw text and renders it in a code editor. Storing a dict left the editor with nothing to display. Reproducible in any tenant.

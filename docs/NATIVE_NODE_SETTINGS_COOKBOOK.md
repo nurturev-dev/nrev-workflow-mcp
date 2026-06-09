@@ -455,6 +455,60 @@ update_node_setting(workflow_id, broken_node_id,
 
 The v0.2.31 path will overwrite the stored dict with the canonical string form on the next save, and the UI editor will start displaying it again.
 
+### Available models (19 total — verified live 2026-06-08 via `/node_definitions/{typeId}`)
+
+The `ai_toolkit-ask_ai-model` field accepts any of these values. Default: `gpt-4.1`. Discoverable at runtime via `get_node_dynamic_fields` (v0.2.32 returns the catalog schema for native nodes — see below).
+
+| Provider | Value | Per-row cost |
+|---|---|---|
+| OpenAI | `gpt-5.4` | 8 |
+| OpenAI | `gpt-5.4-mini` | 3 |
+| OpenAI | `gpt-5.2` | 5 |
+| OpenAI | `gpt-5.1` | 4 |
+| OpenAI | `gpt-5` | 4 |
+| OpenAI | `gpt-5-mini` | 2 |
+| OpenAI | `gpt-5-nano` | 1 |
+| OpenAI | `gpt-4.1` (default) | 2 |
+| OpenAI | `gpt-4.1-mini` | 1 |
+| OpenAI o-series | `o3` | 3 |
+| OpenAI o-series | `o4-mini` | 3 |
+| Parallel Web | `lite` | 2 |
+| Parallel Web | `base` | 3 |
+| Parallel Web | `core-fast` | 5 |
+| Claude | `CLAUDE_OPUS_4_7_INFERENCE_PROFILE_URN` | 8 |
+| Claude | `CLAUDE_OPUS_4_6_INFERENCE_PROFILE_URN` | 8 |
+| Claude | `CLAUDE_SONNET_4_6_INFERENCE_PROFILE_URN` | 5 |
+| Claude | `CLAUDE_HAIKU_4_5_INFERENCE_PROFILE_URN` | 2 |
+
+Claude model values are the full URN — `CLAUDE_<TIER>_<VER>_INFERENCE_PROFILE_URN` — not a slug.
+
+### `web_search_enabled` is OpenAI-only — and irrelevant for Parallel Web
+
+The Ask AI node's `web_search_enabled` toggle is **only valid when the model is one of the OpenAI/o-series models**. This is encoded in the catalog as `conditionalVisibility` on the field — the UI hides the toggle when a Claude or Parallel Web model is selected. The same constraint applies to `prompt_file_urls` (file attachments).
+
+Setting `web_search_enabled=true` with a Claude model produces an invalid configuration — the runtime ignores the flag, but no error is raised. **Don't ship that combination.**
+
+**Parallel Web models (`lite`, `base`, `core-fast`) have web research BAKED IN.** They always do real-time web research as part of their inference; the `web_search_enabled` toggle is meaningless for them (and hidden in the UI). If you need web research with a Claude model, the platform-native path is: use a Parallel Web model instead, OR pipe an upstream research step (a separate Ask AI with an OpenAI+web_search model, or a dedicated web-scrape node) into a Claude Ask AI for the synthesis.
+
+Quick decision tree:
+- "I want web research baked in": **Parallel Web model** (cheapest: `lite` @ 2 credits)
+- "I want a GPT model AND web research": OpenAI model + `web_search_enabled=true` (costs +3 credits per item)
+- "I want a Claude model AND web research": NOT directly supported — use the upstream pattern above
+- "I want a Claude model, no web research": just pick the Claude model; leave `web_search_enabled` off (or unset)
+
+---
+
+## Discovering native node schemas at runtime (v0.2.32)
+
+For any native node, `get_node_dynamic_fields(workflow_id, node_id)` now returns the catalog schema as a fallback (pre-v0.2.32 it just pointed at this cookbook). Use it to discover:
+
+- `fields[].options` — dropdown values (the Ask AI model list, response_type options, etc.)
+- `fields[].conditional_visibility` — cross-field constraints (the OpenAI-only `web_search_enabled`, the `response_type=structured_output` → `response_json` chain, etc.)
+- `fields[].default_value` — the platform's default for unset fields
+- `fields[].required` — what must be present at attach-time
+
+When the cookbook is silent on a node, run `get_node_dynamic_fields` and read the response — it's the source of truth.
+
 ---
 
 ## Extending the cookbook

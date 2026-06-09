@@ -259,34 +259,91 @@ def delete_column(table_id: str, column_id: str) -> dict:
 
 
 def delete_row(table_id: str, row_id: int) -> dict:
-    """DELETE /tables/{table_id}/rows/{row_id} — NOT YET LIVE. Currently 405."""
+    """DELETE /tables/{table_id}/rows/{row_id} — hard-delete one row by ID.
+
+    v0.2.32 — went live 2026-06-02. Returns HTTP 204 (empty body). The
+    MCP wrapper uses the bulk-delete endpoint instead (functionally
+    identical per the API docstring: "Delegates to bulk_delete_rows with a
+    single-element list and discards the payload") so we get a structured
+    response envelope back."""
     return request("DELETE", f"/tables/{table_id}/rows/{int(row_id)}")
 
 
-# ─── M2 endpoints (not yet shipped — will 404/405) ─────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# M2 endpoints — went live 2026-06-02, verified by live probing
+# ═══════════════════════════════════════════════════════════════════════════
 
 
-def aggregate(table_id: str, aggregations: list[dict],
-              group_by: Optional[list[str]] = None,
-              filter_spec: Optional[dict] = None) -> dict:
-    """POST /tables/{table_id}/aggregate — server-side count/sum/avg/min/max
-    + group_by + date_trunc. NOT YET LIVE (M2). Wrapper for forward
-    compatibility."""
-    body: dict = {"aggregations": aggregations}
-    if group_by:
-        body["group_by"] = group_by
-    if filter_spec:
-        body["filter"] = filter_spec
+def bulk_delete_rows(table_id: str, row_ids: list[int]) -> dict:
+    """POST /tables/{table_id}/rows/bulk-delete — atomic delete of up to
+    1000 rows. Missing ids inside row_ids are silently skipped.
+
+    Returns: {deleted_row_ids: [...], table: {row_count, last_updated_at}}.
+    """
+    return request(
+        "POST",
+        f"/tables/{table_id}/rows/bulk-delete",
+        json_body={"row_ids": [int(r) for r in row_ids]},
+    )
+
+
+def aggregate(
+    table_id: str,
+    measures: list[dict],
+    group_by: Optional[list[dict]] = None,
+    filter: Optional[list[dict]] = None,
+    joins: Optional[list[dict]] = None,
+    sort: Optional[list[dict]] = None,
+    limit: Optional[int] = None,
+    skip: Optional[int] = None,
+) -> dict:
+    """POST /tables/{table_id}/aggregate — server-side count / count_distinct
+    / sum / avg / min / max with optional group_by and cross-table joins.
+
+    Quirks confirmed live 2026-06-08:
+      - measure dict: {"op": "sum|avg|...", "column_id": "...", "alias": "..."}
+        (count without column_id is allowed)
+      - group_by dict: {"column_id": "..."} OR {"table_id": "...", "column_id": "..."}
+        for joined-table columns
+      - filter clause: {"column_id": "...", "operator": "eq|...", "value": [...]}
+        Note: "operator" (NOT "op"), and value MUST be a list even for scalar
+        eq. Booleans must be lowercase strings ("true"/"false"). Different
+        from list_rows filter shape.
+      - joins[i]: {"type": "inner|left", "table_id": "...",
+                    "on": {"base_column_id": "...", "joined_column_id": "..."}}
+        Note: "on" is a single dict (single-column joins only).
+
+    Returns: {groups: [{keys: {col_id: value}, measures: {alias: number}}],
+              meta: {group_count, truncated}}.
+    """
+    body: dict = {"measures": measures}
+    if group_by: body["group_by"] = group_by
+    if filter: body["filter"] = filter
+    if joins: body["joins"] = joins
+    if sort: body["sort"] = sort
+    if limit is not None: body["limit"] = int(limit)
+    if skip is not None: body["skip"] = int(skip)
     return request("POST", f"/tables/{table_id}/aggregate", json_body=body)
 
 
-def distinct_values(table_id: str, column_id: str,
-                    filter_spec: Optional[dict] = None) -> dict:
-    """POST /tables/{table_id}/columns/{column_id}/distinct-values — server-
-    side dedup for filter-dropdown population. NOT YET LIVE (M2)."""
+def distinct_values(
+    table_id: str,
+    column_id: str,
+    filter: Optional[list[dict]] = None,
+    search: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> dict:
+    """POST /tables/{table_id}/columns/{column_id}/distinct-values — unique
+    values of a single column (optionally narrowed by filter / substring
+    search). Drives the UI's filter-chip dropdowns.
+
+    `filter` uses the aggregate-style clause shape (operator, value-as-list).
+    `search` is case-insensitive substring on the value.
+    """
     body: dict = {}
-    if filter_spec:
-        body["filter"] = filter_spec
+    if filter: body["filter"] = filter
+    if search is not None: body["search"] = search
+    if limit is not None: body["limit"] = int(limit)
     return request(
         "POST",
         f"/tables/{table_id}/columns/{column_id}/distinct-values",
@@ -294,23 +351,41 @@ def distinct_values(table_id: str, column_id: str,
     )
 
 
-def batch_read(reads: list[dict]) -> dict:
-    """POST /tables/batch-read — collapse N reads into 1 round-trip.
-    NOT YET LIVE (M2)."""
-    return request("POST", "/tables/batch-read", json_body={"reads": reads})
+def join_tables(
+    base_table_id: str,
+    joins: list[dict],
+    base_filter: Optional[list[dict]] = None,
+    select: Optional[list[dict]] = None,
+    sort: Optional[list[dict]] = None,
+    limit: Optional[int] = None,
+    skip: Optional[int] = None,
+) -> dict:
+    """POST /tables/{base_table_id}/join — multi-table inner/left join with
+    optional projection.
 
+    joins[i]: {"type": "inner|left", "table_id": "...",
+               "on": {"base_column_id": "...", "joined_column_id": "..."}}
+    select (optional): [{"table_id": "...", "column_id": "..."}, ...]
+    base_filter: aggregate-style filter clauses (operator + list value).
 
-def join_tables(left_table_id: str, joins: list[dict],
-                filter_spec: Optional[dict] = None,
-                columns: Optional[list[str]] = None,
-                limit: Optional[int] = None) -> dict:
-    """POST /tables/{left_table_id}/join — server-side hash join (up to 3
-    tables in M2). NOT YET LIVE."""
+    Rows come back PREFIX-KEYED: `base.<col_id>` for the driving table,
+    `j0.<col_id>` / `j1.<col_id>` / etc. for joined tables in the order
+    they appear in `joins`. The MCP tool layer name-resolves these for
+    readability before returning.
+    """
     body: dict = {"joins": joins}
-    if filter_spec:
-        body["filter"] = filter_spec
-    if columns:
-        body["columns"] = columns
-    if limit is not None:
-        body["limit"] = int(limit)
-    return request("POST", f"/tables/{left_table_id}/join", json_body=body)
+    if base_filter: body["base_filter"] = base_filter
+    if select: body["select"] = select
+    if sort: body["sort"] = sort
+    if limit is not None: body["limit"] = int(limit)
+    if skip is not None: body["skip"] = int(skip)
+    return request("POST", f"/tables/{base_table_id}/join", json_body=body)
+
+
+# ─── batch-read — wrapper exists in case caller wants it, but no MCP tool ─
+
+def batch_read(reads: list[dict]) -> dict:
+    """POST /tables/batch-read — run 1-20 row reads in parallel. Per-entry
+    partial success in results[i].ok. Not exposed as an MCP tool (no
+    user-side need; the caller can already make 20 list_rows calls)."""
+    return request("POST", "/tables/batch-read", json_body={"reads": reads})

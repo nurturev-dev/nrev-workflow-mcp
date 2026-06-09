@@ -441,19 +441,46 @@ def get_node_preview(
     handle_condition: str = "_default",
     skip: int = 0,
     limit: int = 50,
+    search_string: Optional[str] = None,
 ) -> dict:
     """GET node-output preview for a specific past execution.
 
     Per NREV_WORKFLOW_GUIDE §8: max `limit` is 100 — passing higher silently
     returns 0 rows. We clamp to keep callers safe.
+
+    v0.2.32: `search_string` forwards to the API's cross-table substring
+    filter (case-insensitive, matches across all columns) — the same
+    behavior as the UI's data-preview search box. Optional; omit for the
+    full unfiltered window.
     """
     limit = max(1, min(int(limit), 100))
     skip = max(0, int(skip))
+    params: dict = {"handle_condition": handle_condition, "skip": skip, "limit": limit}
+    if search_string is not None and search_string != "":
+        params["search_string"] = search_string
     return request(
         "GET",
         f"/executions/workflow/{wf_id}/workflow-execution/{exec_id}/node/{node_id}/preview",
-        params={"handle_condition": handle_condition, "skip": skip, "limit": limit},
+        params=params,
     )
+
+
+def get_node_definition(node_definition_id: str) -> dict:
+    """GET /node_definitions/{id} — full catalog entry for a typeId.
+
+    Returns the platform's complete definition including `settings` (the
+    field schema with dataSource.options for select dropdowns and
+    conditionalVisibility for cross-field constraints), ai_metadata,
+    expected_output_columns, etc. This is the source of truth for
+    static-schema introspection of NATIVE nodes (ai_toolkit, linkedin_scraping,
+    people_data, company_data, nrev_tables, etc.) where the dynamic-config
+    endpoint returns 500.
+
+    v0.2.32 — added so `get_node_dynamic_fields` can introspect native
+    nodes' available model dropdown values, conditional-visibility rules
+    (e.g. web_search_enabled only valid for OpenAI models), etc.
+    """
+    return request("GET", f"/node_definitions/{node_definition_id}")
 
 
 def credit_balance(tenant_id: int = 0) -> int:
